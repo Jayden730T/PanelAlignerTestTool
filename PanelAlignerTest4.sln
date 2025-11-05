@@ -1,0 +1,35 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.11.35222.181
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PanelAlignerTest4", "PanelAlignerTest4.csproj", "{FE01E24D-2BA1-49F8-A79D-9C34B2D9E898}"
+EndProject
+Project("{D954291E-2A0B-460D-934E-DC6B0785DB48}") = "RorzeCommon", "RorzeCommon\RorzeCommon.shproj", "{9F4583FF-F52C-40B0-B3E3-4DFD39124109}"
+EndProject
+Project("{D954291E-2A0B-460D-934E-DC6B0785DB48}") = "RorzeUnit", "RorzeUnit\RorzeUnit.shproj", "{A1F3E5DA-C2E1-485C-B572-4D636B8642EB}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FE01E24D-2BA1-49F8-A79D-9C34B2D9E898}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FE01E24D-2BA1-49F8-A79D-9C34B2D9E898}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FE01E24D-2BA1-49F8-A79D-9C34B2D9E898}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FE01E24D-2BA1-49F8-A79D-9C34B2D9E898}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2C822FF1-1A4A-4084-8608-B6009029336E}
+	EndGlobalSection
+	GlobalSection(SharedMSBuildProjectFiles) = preSolution
+		RorzeCommon\RorzeCommon.projitems*{9f4583ff-f52c-40b0-b3e3-4dfd39124109}*SharedItemsImports = 13
+		RorzeUnit\RorzeUnit.projitems*{a1f3e5da-c2e1-485c-b572-4d636b8642eb}*SharedItemsImports = 13
+		RorzeCommon\RorzeCommon.projitems*{fe01e24d-2ba1-49f8-a79d-9c34b2d9e898}*SharedItemsImports = 4
+		RorzeUnit\RorzeUnit.projitems*{fe01e24d-2ba1-49f8-a79d-9c34b2d9e898}*SharedItemsImports = 4
+	EndGlobalSection
+EndGlobal

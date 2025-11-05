@@ -1,0 +1,260 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace RorzeUnit.Class.Tower.Evnt
+{
+    public class TowerEventArgs
+    {
+        public delegate void AutoProcessingEventHandler(object sender, object loaderManual);
+        public class TowerProtoclEventArgs : EventArgs
+        {
+            public StatFrame Frame { get; set; }
+            public TowerProtoclEventArgs(string frame)
+            {
+                Frame = new StatFrame(frame);
+            }
+        }
+        public class StatFrame
+        {
+            private string _strFrame;   //aSTK1.STAT:00000/0000
+
+            private char _charHeader;   //o,a,n,c,e
+            private string _strID;      //TRB1.
+            private string _strData;    //STAT:00000/0000
+
+            private int _nBodyNo;       //1
+            private string _strCommand; //STAT
+            private string _strValue;   //00000/0000
+
+            public StatFrame(string strFrame)
+            {
+                _strFrame = strFrame.Trim('\r', '\n');
+
+                _charHeader = _strFrame[0];
+                _strID = _strFrame.Substring(1, 5);
+                _strData = _strFrame.Substring(6);
+
+                _nBodyNo = _strID[3] >= 'A' ? _strID[3] - 'A' + 10 : _strID[3] - '0';
+                _strCommand = _strData.Split(':')[0];
+                _strValue = _strData.Contains(':') ? _strData.Split(':')[1] : "";
+            }
+
+            public char Header { get { return _charHeader; } }
+            public string ID { get { return _strID; } }
+            public string Data { get { return _strData; } }
+            public int BodyNo { get { return _nBodyNo; } }
+            public string Command { get { return _strCommand; } }
+            public string Value { get { return _strValue; } }
+
+        }
+        public class TowerGPIO
+        {
+            private string _strPi;
+            private string _strPo;
+            private long _nPi;
+            private long _nPo;
+
+            public enum enumTowerDI
+            {
+                EmergencyStop = 0,
+                TemprorarilyStop,
+                XCDA_Source_Pressure,
+                N2_Source_Pressure,
+                Tower1_Source_Pressure,
+                Tower2_Source_Pressure,
+                Tower3_Source_Pressure,
+                Tower4_Source_Pressure,
+
+                BarOpen_Left,
+                BarClose_Left,
+                BarOpen_Right,
+                BarClose_Right,
+                ShutterDetection,
+                WaferDetection,
+                ExhaustFan,
+                Reserve_15,
+
+                Reserve_16,
+                Reserve_17,
+                Reserve_18,
+                Reserve_19,
+                Reserve_20,
+                Reserve_21,
+                Reserve_22,
+                Reserve_23,
+
+                Reserve_24,
+                Reserve_25,
+                Reserve_26,
+                Reserve_27,
+                Reserve_28,
+                Reserve_29,
+                Reserve_30,
+                Reserve_31,
+
+                Tower1_Container1,
+                Tower1_Container2,
+                Tower1_Container3,
+                Tower1_Container4,
+                Tower1_Container5,
+                Tower1_Container6,
+                Tower1_Container7,
+                Tower1_Container8,
+
+                Tower2_Container1,
+                Tower2_Container2,
+                Tower2_Container3,
+                Tower2_Container4,
+                Tower2_Container5,
+                Tower2_Container6,
+                Tower2_Container7,
+                Tower2_Container8,
+
+                Tower3_Container1,
+                Tower3_Container2,
+                Tower3_Container3,
+                Tower3_Container4,
+                Tower3_Container5,
+                Tower3_Container6,
+                Tower3_Container7,
+                Tower3_Container8,
+
+                Tower4_Container1,
+                Tower4_Container2,
+                Tower4_Container3,
+                Tower4_Container4,
+                Tower4_Container5,
+                Tower4_Container6,
+                Tower4_Container7,
+                Tower4_Container8,
+            }
+
+            public enum enumTowerDO
+            {
+                PreParationCmplet = 0,
+                TemprorarilyStop,
+                Significanterror,
+                Lighterror,
+                Reserve_04,
+                Reserve_05,
+                Reserve_06,
+                Reserve_07,
+
+                BarOpen,
+                BarClose,
+                Reserve_10,
+                Reserve_11,
+                Reserve_12,
+                Reserve_13,
+                Reserve_14,
+                Reserve_15,
+
+                Reserve_16,
+                Reserve_17,
+                Reserve_18,
+                Reserve_19,
+                Reserve_20,
+                Reserve_21,
+                Reserve_22,
+                Reserve_23,
+
+                Reserve_24,
+                Reserve_25,
+                Reserve_26,
+                Reserve_27,
+                Reserve_28,
+                Reserve_29,
+                Reserve_30,
+                Reserve_31,
+
+                Tower1_Container1,
+                Tower1_Container2,
+                Tower1_Container3,
+                Tower1_Container4,
+                Tower1_Container5,
+                Tower1_Container6,
+                Tower1_Container7,
+                Tower1_Container8,
+
+                Tower2_Container1,
+                Tower2_Container2,
+                Tower2_Container3,
+                Tower2_Container4,
+                Tower2_Container5,
+                Tower2_Container6,
+                Tower2_Container7,
+                Tower2_Container8,
+
+                Tower3_Container1,
+                Tower3_Container2,
+                Tower3_Container3,
+                Tower3_Container4,
+                Tower3_Container5,
+                Tower3_Container6,
+                Tower3_Container7,
+                Tower3_Container8,
+
+                Tower4_Container1,
+                Tower4_Container2,
+                Tower4_Container3,
+                Tower4_Container4,
+                Tower4_Container5,
+                Tower4_Container6,
+                Tower4_Container7,
+                Tower4_Container8,
+            }
+
+            Dictionary<enumTowerDI, bool> _DIList = new Dictionary<enumTowerDI, bool>();
+
+            Dictionary<enumTowerDO, bool> _D0List = new Dictionary<enumTowerDO, bool>();
+
+            //DO
+            public Dictionary<enumTowerDI, bool> GetDIList { get { return _DIList; } }
+            //DI
+            public Dictionary<enumTowerDO, bool> GetD0List { get { return _D0List; } }
+
+            private bool isBitOn(Int64 nValue, int nBit)
+            {
+                Int64 nOne = 1;
+                Int64 nV = nOne << nBit;
+                return ((nValue & nV) == nV);
+            }
+
+            public TowerGPIO(string Pi, string Po)
+            {
+                _strPi = Pi;
+                _strPo = Po;
+                _nPi = Convert.ToInt64(_strPi, 16);
+                _nPo = Convert.ToInt64(_strPo, 16);
+
+                for (int i = 0; i < 64; i++)
+                {
+                    if (_strPi.Length * 4 > i)//Loadport io lenght 8(32bit) or 16(64bit)
+                    {
+                        _DIList.Add((enumTowerDI)i, isBitOn(_nPi, i));
+                        _D0List.Add((enumTowerDO)i, isBitOn(_nPo, i));
+                    }
+                    else
+                    {
+                        _DIList.Add((enumTowerDI)i, false);
+                        _D0List.Add((enumTowerDO)i, false);
+                    }
+                }
+            }
+        }
+        public class TowerGMAP_EventArgs : EventArgs
+        {
+            public TowerGMAP_EventArgs(string strMappingData, int nBodyNo)
+            {
+                MappingData = strMappingData;
+                BodyNo = nBodyNo;             
+            }
+            public string MappingData { get; set; }        
+            public int BodyNo { get; set; }
+        }
+
+       
+    }
+}

@@ -1,0 +1,342 @@
+﻿using System;
+using System.Runtime.CompilerServices;
+using System.Windows.Forms;
+using RorzeComm.Log;
+using RorzeUnit.Class;
+using RorzeUnit.Class.Aligner;
+using RorzeUnit.Interface;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.Tab;
+using RorzeComm.Threading;
+using AAComm;
+using System.Collections;
+using System.Drawing;
+using System.Threading;
+
+
+namespace PanelAlignerTest4
+{
+    public partial class Form1 : Form
+    {
+        I_Aligner m_aligner;
+        private SPollingThread _exePolling;
+        private SLogger m_Logger = SLogger.GetLogger("CommunicationLog");
+        public Form1()
+        {
+            InitializeComponent();
+            m_aligner = new SSAlignerPanelXYR(1, false, false);
+
+            _exePolling = new SPollingThread(10);
+            _exePolling.DoPolling += _exe_DoPolling;
+
+        }
+        private void WriteLog(string strContent, [CallerMemberName] string meberName = null, [CallerLineNumber] int lineNumber = 0)
+        {
+            string strMsg = string.Format("[ALN{0}] : {1}  at line {2} ({3})", 1, strContent, lineNumber, meberName);
+            m_Logger.WriteLog(strMsg);
+        }
+        private void _exe_DoPolling()
+        {
+            m_aligner.ResetInPos();
+            m_aligner.AlignerMoveTest_MABS(int.Parse(tB_MABS_R.Text), int.Parse(tB_MABS_X.Text), int.Parse(tB_MABS_Y.Text));
+            m_aligner.WaitInPos(30000);
+
+            m_aligner.ResetInPos();
+            m_aligner.AlignerMoveTest_MREL(int.Parse(tB_MREL_R.Text), int.Parse(tB_MREL_X.Text), int.Parse(tB_MREL_Y.Text));
+            m_aligner.WaitInPos(30000);
+
+        }
+        private void bt_ALGN_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_ALGN.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.ALGN(1);
+                m_aligner.WaitInPos(30000);
+                bt_ALGN.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_ALGN.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_ALGN.Enabled = true;
+            }
+        }
+
+        private void bt_ORGN_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_ORGN.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.ORGN();
+                m_aligner.WaitInPos(30000);
+                bt_ORGN.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_ORGN.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_ORGN.Enabled = true;
+            }
+        }
+
+        private void bt_R_EXTD_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_R_EXTD.Enabled = false;
+                int distance = int.Parse(tB_EXTD_Distance.Text);
+                m_aligner.ResetInPos();
+                m_aligner.Rot1EXTD(distance);
+                m_aligner.WaitInPos(30000);
+                bt_R_EXTD.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_R_EXTD.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_R_EXTD.Enabled = true;
+            }
+        }
+
+        private void bt_R_STEP_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_R_STEP.Enabled = false;
+                int distance = int.Parse(tB_EXTD_Distance.Text);
+                m_aligner.ResetInPos();
+                m_aligner.Rot1STEP(distance);
+                m_aligner.WaitInPos(30000);
+                bt_R_STEP.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_R_STEP.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_R_STEP.Enabled = true;
+            }
+
+        }
+
+        private void bt_INIT_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_INIT.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.INIT();
+                m_aligner.WaitInPos(30000);
+                bt_INIT.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_INIT.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_INIT.Enabled = true;
+            }
+        }
+
+        private void bt_RSTA_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_RSTA.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.RSTA(1);
+                m_aligner.WaitInPos(30000);
+                bt_RSTA.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_RSTA.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_RSTA.Enabled = true;
+            }
+        }
+
+        private void bt_MRAL_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                WriteLog("bt_MRAL:Start");
+                bt_MRAL.Enabled = false;
+                m_aligner.AlignerMoveTest_MREL(int.Parse(tB_MREL_R.Text), int.Parse(tB_MREL_X.Text), int.Parse(tB_MREL_Y.Text));
+                bt_MRAL.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_MRAL.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_MRAL.Enabled = true;
+            }
+        }
+
+        private void bt_MABS_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                WriteLog("bt_MABS:Start");
+                bt_MABS.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.AlignerMoveTest_MABS(int.Parse(tB_MABS_R.Text), int.Parse(tB_MABS_X.Text), int.Parse(tB_MABS_Y.Text));
+                m_aligner.WaitInPos(30000);
+                bt_MABS.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_MABS.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_MABS.Enabled = true;
+            }
+        }
+
+        private void bt_Cycle_Click(object sender, EventArgs e)
+        {
+            _exePolling.Set();
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            CommAPI m_MCtrlComm = new CommAPI();
+            m_MCtrlComm.CloseAACommServer(true);
+
+
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+
+        }
+
+        private void bt_STOP_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_MABS.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.STOP();
+                m_aligner.WaitInPos(30000);
+                bt_MABS.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_MABS.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_MABS.Enabled = true;
+            }
+        }
+
+        private void bt_CLMP_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_CLMP.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.CLMP();
+                m_aligner.WaitInPos(30000);
+                bt_CLMP.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_CLMP.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_CLMP.Enabled = true;
+            }
+        }
+
+        private void bt_UCLM_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                bt_UCLM.Enabled = false;
+                m_aligner.ResetInPos();
+                m_aligner.UCLM();
+                m_aligner.WaitInPos(30000);
+                bt_UCLM.Enabled = true;
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>>" + ex);
+                bt_UCLM.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>>" + ex);
+                bt_UCLM.Enabled = true;
+            }
+        }
+
+        private void bt_Cycle_Click_1(object sender, EventArgs e)
+        {
+            while (true)
+            {
+                if(m_aligner.IsError)
+                    break;
+                bt_ORGN.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+                Thread.Sleep(300);
+                bt_UCLM.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+                Thread.Sleep(300);
+                bt_CLMP.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+                Thread.Sleep(300);
+                bt_MRAL.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+                bt_MRAL.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+                bt_MABS.PerformClick();
+                if (m_aligner.IsError)
+                    break;
+
+            }
+        }
+    }
+}

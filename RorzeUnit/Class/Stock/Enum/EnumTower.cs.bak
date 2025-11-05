@@ -1,0 +1,256 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace RorzeUnit.Class.Tower.Enum
+{
+    public enum enumTowerMode : int { Initializing, Remote, Maintenance, Recovery }
+
+    public enum enumTowerStatus : int { InPos, Moving, Pause };
+
+    public enum enumTowerWaferType : int { eNone = 0, eInch12 = 1, eInch8 = 2, eFrame = 3 };
+
+    public enum enumTowerSignalTable : int
+    {
+        /// <summary>
+        /// 自動模式中 STAT.S1.1 = 1(Remote)
+        /// </summary>
+        Remote,
+        /// <summary>
+        /// 手動模式中 STAT.S1.1 = 3(Recovery)
+        /// </summary>
+        Recovery,
+        /// <summary>
+        /// 原點復歸完成 STAT.S1.2 = 1(Origin return completion)
+        /// </summary>
+        OPRCompleted,
+        /// <summary>
+        /// 命令處理完成 STAT.S1.3 = 0(Stop)
+        /// </summary>
+        ProcessCompleted,
+        /// <summary>
+        /// 運動到位 STAT.S1.4 = 0(Stop)
+        /// </summary>
+        MotionCompleted,
+        /// <summary>
+        /// Client端第一次連線應答 [CNCT]
+        /// </summary>
+        Connected,
+        StepCompleted,
+        Max
+    }
+
+    public enum enumTowerCommand
+    {
+
+        Orgn,
+        Home,
+        Extend,
+        Load,
+        Unload,
+        Clamp,
+        UnClamp,
+        Mapping,
+
+
+        E84Load,
+
+        E84UnLoad,
+
+        SetEvent,
+
+        Reset,
+
+        Initialize,
+
+        Stop,
+
+        Pause,
+
+        Mode,
+
+        Wtdt,
+
+        GetData,
+
+        TransferData,
+
+        Speed,
+
+        SetIO,
+
+        Status,
+
+        GetIO,
+
+        GetMappingData,
+
+        GetVersion,
+      
+        GetLog,
+  
+        SetDateTime,
+      
+        GetDateTime,
+   
+        GetPos,
+     
+        GetType,
+     
+        SetType,
+     
+        CheckSum,
+        ZaxStep,
+        ZaxHome,
+        YaxStep,
+        YaxHome,
+        RotHome,
+      
+        ReadID,
+     
+        WriteID,
+
+        GetDPRM,
+ 
+        SetDPRM,
+
+        GetDMPR,
+  
+        SetDMPR,
+ 
+        GetDCST,
+
+        SetDCST,
+        ClientConnected,
+        Max
+    }
+
+    //======================================================================
+    public enum enumTowerCustomError : int
+    {
+        SendCommandFailure = 1,
+        OriginPosReturnFailure = 2,
+        OriginPosReturnTimeout = 3,
+        MovingHomePosFailure = 4,
+        AckTimeout = 5,
+        ExtendingArmFailure = 6,
+        TakeWaferFailure = 7,
+        PutWaferFailure = 8,
+        WaferExchangeFailure = 9,
+        TurnOnVacuumFailure = 10,
+        TurnOffVacuumFailure = 11,
+        MappingFailure = 12,
+        GetMappingDataFailure = 13,
+        GetStatusFailure = 14,
+        ResetFailure = 15,
+        InitialFailure = 16,
+        StopMotionTimeout = 17,
+        StopMotionFailure = 18,
+        PauseMotionTimeout = 19,
+        PauseMotionFailure = 20,
+        SetSpeedFailure = 21,
+        SingleAxisAckTimeout = 22,
+        SingleAxisOPRFailure = 23,
+        SingleAxisAbsoluteMovingFailure = 24,
+        SingleAxisJogMovingTimeout = 25,
+        SingleAxisJogMovingFailure = 26,
+        SingleAxisGetPosFailure = 27,
+        MotionTimeout = 28,
+        ModeTimeout = 29,
+        EncoderBatteryError = 30,
+        RobotNoInManualMode = 31,
+        XAxisMotionTimeout = 32,
+        NotFoundAvailableArm = 33,
+        UploadTeachingDataFailure = 34,
+        DownloadTeachingDataFailure = 35,
+        ModeFailure = 36,
+        RejectManualFuncWhenAuto = 37,
+        GetMaintenanceDataFailure = 38,
+        SetParameterFailure = 39,
+        ProgramError = 40,
+        RobotError = 41,
+        RobotIsBusy = 42,
+        ManualMode = 43,
+        SettingWithoutWaferOut = 44,
+        SettingWithoutWaferIn = 45,
+        InterlockStop = 46,
+        InitialRejectWhenAuto = 47,
+        MotionAbnormal = 48,
+        WaferAndDataNotMatch = 49,
+        ProcessFlagTimeout = 50,
+        ProcessFlagAbnormal = 51,
+
+        E84Auto_FOUPManualRemove = 52,
+        E84Auto_FOUPManualDetect = 53,
+
+        Max = 64,
+    }
+    public enum enumTowerAixsError : int
+    {
+        Others = 0,
+        YAxis = 1,
+        ZAxis = 2,
+        liftLowforReadID = 3,
+        Stageretaining = 4,
+        Driver = 15,
+        IOUnit1 = 16,
+        IOUnit2 = 17,
+        IOUnit3 = 18,
+        IOUnit4 = 19,
+        IOUnit5 = 20,
+        IOUnit6 = 21,
+        IOUnit7 = 22,
+        IOUnit8 = 23,
+        IOUnit9 = 24,
+        IOUnit10 = 25,
+        IOUnit11 = 26,
+        IOUnit12 = 27,
+
+    }
+    public enum enumTowerErrorCode : int
+    {
+        MotorTimeout = 1,
+        SensorAbnormal = 2,
+        EmergenyStop = 3,
+        CommmandError = 4,
+        CommunicationError = 5,
+        ChuckingSensorAbnormal = 6,
+        Reserved7 = 7,
+        Obstacledetection = 8,
+        SecondorgnError = 9,
+        MappingError = 10,
+        ProtrusionError = 11,
+        DriverError = 14,
+        ControlError = 32,
+        DivePowerError = 33,
+        EEPROMError = 34,
+        ZSeachError = 35,
+        overheat = 36,
+        overcurrnt = 37,
+        MotorCabelError = 38,
+        PositionStall = 39,
+        OverTineStall = 40,
+        fanError = 137,
+        ClmpRotaDisable = 146,
+        UCMPRotaDisable = 147,
+        LatchLockDisable = 148,
+        LatchUnLockDisable = 150,
+        MappingPreparationDisable = 151,
+        MappingcontationDisable = 152,
+        ChuckDisavble = 153,
+        WaferProtrusion = 154,
+        CoverError = 155,
+        CarrierTake = 156,
+        CarrierPlaced = 158,
+        CarrierDelection = 159,
+        TRREQTimeout = 176,
+        BUSYONTimeout = 177,
+        CarrierCarryinTimeout = 178,
+        CarrierCarryoutTimeout = 179,
+        BUSYOFFTimeout = 180,
+        ReservedB5 = 181,
+        VALDOFFTimeout = 182,
+        CONTINUETimeout = 183,
+        VALDCS0error = 191,
+    }
+}

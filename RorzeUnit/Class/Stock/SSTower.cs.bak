@@ -1,0 +1,1588 @@
+﻿using RorzeComm;
+using RorzeComm.Log;
+using RorzeComm.Threading;
+using RorzeUnit.Class.Tower.Enum;
+using RorzeUnit.Event;
+using RorzeUnit.Interface;
+using RorzeUnit.Net.Sockets;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using static RorzeUnit.Class.Tower.Evnt.TowerEventArgs;
+
+namespace RorzeUnit.Class.Tower
+{
+    public class SSTower : I_Tower
+    {
+        #region =========================== Private ============================================
+        private enumTowerMode m_eStatMode;       //記憶的STAT S1第1
+        private bool m_bStatOrgnComplete;        //記憶的STAT S1第2
+        private bool m_bStatProcessed;           //記憶的STAT S1第3
+        private enumTowerStatus m_eStatInPos;    //記憶的STAT S1第4
+        private int m_nSpeed;                    //記憶的STAT S1第5
+        private string m_strErrCode = "0000";    //記憶的STAT S2
+
+        protected int m_nAckTimeout = 3000;
+        protected int m_nMotionTimeout = 60000;
+
+
+        private SLogger m_logger = SLogger.GetLogger("CommunicationLog");
+        private sRorzeSocket m_Socket;
+
+        private int m_nWaferTotal = 25;// 由mapping完成時改變
+
+        private bool m_bMoving;//Robot運動中
+
+        private bool m_bRobotExtand = false;
+
+        private bool ProcessStart { get; set; }
+
+        TowerGPIO m_gpio;
+
+        #endregion
+        #region =========================== Public =============================================
+        public bool Simulate { get; private set; }
+        public bool Connected { get; private set; }
+        public int BodyNo { get; private set; }
+        public bool Disable { get; private set; }
+        public string VersionData { get; private set; }
+
+        public bool IsRobotExtend { get { return m_bRobotExtand; } }
+        public bool SetRobotExtend { set { m_bRobotExtand = value; } }
+
+        //STAT S1第1 bit
+        public enumTowerMode StatMode { get { return m_eStatMode; } }
+        public bool IsInitialized { get { return m_eStatMode == enumTowerMode.Remote; } }
+        //STAT S1第2 bit
+        public bool IsOrgnComplete { get { return m_bStatOrgnComplete; } }
+        //STAT S1第3 bit
+        public bool IsProcessing { get { return m_bStatProcessed; } }
+        //STAT S1第4 bit
+        public enumTowerStatus InPos { get { return m_eStatInPos; } }
+        public bool IsMoving { get { return m_bMoving || m_eStatInPos == enumTowerStatus.Moving; } }
+        //STAT S1第5 bit
+        public int GetSpeed { get { return m_nSpeed; } }
+        //STAT S2
+        public bool IsError { get { return (m_strErrCode != "0000"); } }
+
+        public int WaferTotal { get { return m_nWaferTotal; } }//Foup內部有幾層，並不是有幾片
+
+        public enumTowerWaferType WaferType { get; private set; }//讀取ini
+
+        #endregion
+        #region =========================== Event ==============================================
+        public event EventHandler<WaferDataEventArgs> OnAssignWaferData;
+        public event EventHandler<int> OnWaferDataDelete;
+
+        public event EventHandler<bool> OnORGNComplete;
+        public event EventHandler<bool> OnGetDataComplete;
+        public event EventHandler<TowerGMAP_EventArgs> OnMappingComplete;
+
+        public event EventHandler OnProcessStart;
+        public event EventHandler OnProcessEnd;
+        public event EventHandler OnProcessAbort;
+
+        public event AutoProcessingEventHandler DoManualProcessing;
+        public event AutoProcessingEventHandler DoAutoProcessing;
+
+        public event MessageEventHandler OnReadData;
+
+        public event OccurErrorEventHandler OnOccurStatErr;
+        public event OccurErrorEventHandler OnOccurCancel;
+        public event OccurErrorEventHandler OnOccurCustomErr;
+        public event OccurErrorEventHandler OnOccurErrorRest;
+
+        public event dlgv_n OnTakeWaferOutFoup;              //wafer從foup中被取出
+        public event dlgv_n OnTakeWaferInFoup;               //wafer被放回foup
+
+
+        #endregion ======================================================================
+        #region =========================== Thread =============================================
+        private SInterruptOneThread _threadInit;             //初始化控制(private 流程, 問Status/機況同步)
+        private SInterruptOneThread _threadOrgn;             //原點復歸控制
+
+        private SInterruptOneThread _threadMapping;          //掃片單動控制  
+        private SInterruptOneThreadINT _threadReset;         //異常復歸控制
+        private SInterruptOneThread _threadGetData;
+
+        private SPollingThread _pollingAuto;                 //自動流程控管   
+
+        private SPollingThread _exePolling;
+        #endregion
+        #region =========================== Delegate ===========================================
+        public dlgb_v pLoadInterlock { get; set; }           // 不可以load
+        public dlgb_v pUnloadInterlock { get; set; }         // 不可以unload
+        public dlgv_wafer AssignToRobotQueue { get; set; }   //丟給robot作排程
+        #endregion
+        #region =========================== Signals ============================================
+        private Dictionary<enumTowerCommand, SSignal> _signalAck = new Dictionary<enumTowerCommand, SSignal>();
+        private Dictionary<enumTowerSignalTable, SSignal> _signals = new Dictionary<enumTowerSignalTable, SSignal>();
+        private SSignal _signalSubSequence;
+        #endregion    
+        #region =========================== Property ===========================================
+        internal string _MappingData = "";
+        public string MappingData
+        {
+            get
+            {
+                return _MappingData;
+            }
+            set
+            {
+                _MappingData = value;
+                m_nWaferTotal = _MappingData.Length;
+
+                #region 在mapping完成後會建立資料，容器是 Waferlist
+
+                //利用GWID得到的type判斷是哪一種type
+                SWafer.enumWaferSize eWaferSize;
+                enumTowerWaferType eType = WaferType;//ini
+                switch (eType)
+                {
+                    case enumTowerWaferType.eFrame:
+                        eWaferSize = SWafer.enumWaferSize.Frame;
+                        break;
+                    case enumTowerWaferType.eInch12:
+                        eWaferSize = SWafer.enumWaferSize.Inch12;
+                        break;
+                    case enumTowerWaferType.eInch8:
+                        eWaferSize = SWafer.enumWaferSize.Inch08;
+                        break;
+                    default:
+                        eWaferSize = SWafer.enumWaferSize.Unknow;
+                        break;
+                }
+
+
+                DateTime dt = DateTime.Now;
+                Waferlist.Clear();
+                for (int i = 0; i < _MappingData.Length; i++)
+                {
+                    if (_MappingData[i] == '1')
+                    {
+                        _Waferlist.Add(new SWafer(
+                            "",
+                            "lotID",
+                            "CJID-" + dt.ToString("yyyyMMddHHmmss"),
+                            "PJID-" + dt.ToString("yyyyMMddHHmmss"),
+                            "RECIPE",
+                            i + 1,//20220708
+                            eWaferSize,
+                            SWafer.enumPosition.Loader1 + BodyNo - 1,
+                            SWafer.enumFromLoader.Loader1 + BodyNo - 1,
+                            SWafer.enumProcessStatus.Sleep)
+                            );
+                    }
+                    else if (_MappingData[i] == '0')
+                    {
+                        Waferlist.Add(null);
+                    }
+                    else
+                    {
+                        _Waferlist.Add(new SWafer(
+                          "",
+                          "lotID",
+                          "CJID-" + dt.ToString("yyyyMMddHHmmss"),
+                          "PJID-" + dt.ToString("yyyyMMddHHmmss"),
+                          "RECIPE",
+                          i + 1,//20220708
+                          eWaferSize,
+                          SWafer.enumPosition.Loader1 + BodyNo - 1,
+                          SWafer.enumFromLoader.Loader1 + BodyNo - 1,
+                          SWafer.enumProcessStatus.Error)
+                          );
+                    }
+
+                }
+                #endregion
+            }
+        }
+        public string SimulateMappingData
+        {
+            set
+            {
+                MappingData = value;
+            }
+        }
+        public bool SimulateCheckFoupExist { get; set; }
+
+        private int m_nRaxisPos;
+        private int m_nZaxisPos;
+        public int GetRaxisPos { get { return m_nRaxisPos; } }
+        public int GetZaxisPos { get { return m_nZaxisPos; } }
+        #endregion ======================================================================
+        #region =========================== Wafer Data =========================================
+        private List<SWafer> _Waferlist = new List<SWafer>();
+        public List<SWafer> Waferlist { get { return _Waferlist; } }
+
+        public SWafer TakeWaferOutFoup(int nIndex)//手動模式下被Robot取出
+        {
+            SWafer wafer = Waferlist[nIndex];
+            Waferlist[nIndex] = null;
+
+            OnTakeWaferOutFoup?.Invoke(nIndex + 1);
+
+            string str = _MappingData;
+            str = str.Remove(nIndex, 1);
+            str = str.Insert(nIndex, "0");
+            _MappingData = str;
+
+            return wafer;
+        }
+        public void TakeWaferInFoup(int nIndex, SWafer wafer)//Robot放wafer到Loadport裡面
+        {
+            switch (BodyNo)//重新定義位置
+            {
+                case 1: wafer.SetOwner(SWafer.enumFromLoader.Loader1); break;
+                case 2: wafer.SetOwner(SWafer.enumFromLoader.Loader2); break;
+                case 3: wafer.SetOwner(SWafer.enumFromLoader.Loader3); break;
+                case 4: wafer.SetOwner(SWafer.enumFromLoader.Loader4); break;
+                case 5: wafer.SetOwner(SWafer.enumFromLoader.Loader5); break;
+                case 6: wafer.SetOwner(SWafer.enumFromLoader.Loader6); break;
+                case 7: wafer.SetOwner(SWafer.enumFromLoader.Loader7); break;
+                case 8: wafer.SetOwner(SWafer.enumFromLoader.Loader8); break;
+            }
+
+
+            wafer.Slot = nIndex + 1;//重新定義位置
+
+            Waferlist[nIndex] = wafer;
+
+            OnTakeWaferInFoup?.Invoke(nIndex + 1);//用於UI//用於UI
+
+            string str = _MappingData;
+            str = str.Remove(nIndex, 1);
+            str = str.Insert(nIndex, "1");
+            _MappingData = str;
+        }
+
+        #endregion
+        #region =========================== OnOccurError =======================================
+        //  發生STAT異常
+        private void SendAlmMsg(string strCode, [CallerLineNumber] int lineNumber = 0, [CallerMemberName] string caller = null)
+        {
+            WriteLog(string.Format("Occur stat Error : {0}", strCode), lineNumber, caller);
+            if (strCode.Length != 4) return;
+            int nCode = Convert.ToInt32(strCode, 16);
+            OnOccurStatErr?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        //  解除STAT異常
+        private void RestAlmMsg(string strCode, [CallerLineNumber] int lineNumber = 0, [CallerMemberName] string caller = null)
+        {
+            WriteLog(string.Format("Rest stat Error : {0}", strCode), lineNumber, caller);
+            if (strCode.Length != 4) return;
+            int nCode = Convert.ToInt32(strCode, 16);
+            OnOccurErrorRest?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        //  Cancel Code
+        private void SendCancelMsg(string strCode, [CallerLineNumber] int lineNumber = 0, [CallerMemberName] string caller = null)
+        {
+            WriteLog(string.Format("Occur cancel : {0}", strCode), lineNumber, caller);
+            if (strCode.Length != 4) return;
+            int nCode = Convert.ToInt32(strCode, 16);
+            OnOccurCancel?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        //  發生自定義異常
+        private void SendAlmMsg(enumTowerCustomError eAlarm, [CallerLineNumber] int lineNumber = 0, [CallerMemberName] string caller = null)
+        {
+            WriteLog(string.Format("Occur custom error : {0}", eAlarm), lineNumber, caller);
+            int nCode = (int)eAlarm;
+            OnOccurCustomErr?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        #endregion
+        #region =========================== CreateMessage ======================================
+        private Dictionary<enumTowerCommand, string> _dicCmdsTable;
+        public Dictionary<int, string> m_dicCancel { get; } = new Dictionary<int, string>();
+        public Dictionary<int, string> m_dicController { get; } = new Dictionary<int, string>();
+        public Dictionary<int, string> m_dicError { get; } = new Dictionary<int, string>();
+        private void CreateMessage()
+        {
+            m_dicCancel[0x0200] = "0200:The operating objective is not supported";
+            m_dicCancel[0x0300] = "0300:The composition elements of command are too few";
+            m_dicCancel[0x0310] = "0310:The composition elements of command are too many";
+            m_dicCancel[0x0400] = "0400:Command is not supported";
+            m_dicCancel[0x0500] = "0500:Too few parameters";
+            m_dicCancel[0x0510] = "0510:Too many parameters";
+            for (int i = 0; i < 0x10; i++)
+            {
+                m_dicCancel[0x0600 + i] = string.Format("{0:X4}:The parameter No.{1} is too small", 0x0600 + i, i + 1);
+                m_dicCancel[0x0610 + i] = string.Format("{0:X4}:The Parameter No.{1} is too large", 0x0610 + i, i + 1);
+                m_dicCancel[0x0620 + i] = string.Format("{0:X4}:The Parameter No.{1} is not numeral", 0x0620 + i, i + 1);
+                m_dicCancel[0x0630 + i] = string.Format("{0:X4}:The Parameter No.{1} is not correct", 0x0630 + i, i + 1);
+                m_dicCancel[0x0640 + i] = string.Format("{0:X4}:The Parameter No.{1} is not a hexadecimal numeral", 0x0640 + i, i + 1);
+                m_dicCancel[0x0650 + i] = string.Format("{0:X4}:The Parameter No.{1} is not correct", 0x0650 + i, i + 1);
+                m_dicCancel[0x0660 + i] = string.Format("{0:X4}:The Parameter No.{1} is not pulse", 0x0660 + i, i + 1);
+
+                m_dicCancel[0x1030 + i] = string.Format("{0:X4}:Interfering with No.{1} axis", 0x1030 + i, i + 1);
+            }
+            m_dicCancel[0x0700] = "0700:Abnormal Mode: Not ready";
+            m_dicCancel[0x0702] = "0702:Abnormal Mode: Not in the maintenance mode";
+            for (int i = 0; i < 0x0100; i++)
+            {
+                m_dicCancel[0x0800 + i] = string.Format("{0:X4}:Setting data of No.{1} is not correct!", 0x0800 + i, i + 1);
+            }
+            m_dicCancel[0x0920] = "0902:Improper setting";
+            m_dicCancel[0x0A00] = "0A00:Origin search not completed";
+            m_dicCancel[0x0A01] = "0A01:Origin reset not completed";
+            m_dicCancel[0x0B00] = "0B00:Processing";
+            m_dicCancel[0x0B01] = "0B01:Moving";
+            m_dicCancel[0x0D00] = "0D00:Abnormal flash memory";
+            m_dicCancel[0x0F00] = "0F00:Error-occurred state";
+            m_dicCancel[0x1000] = "1000:Movement is unable due to carrier presence";
+            m_dicCancel[0x1001] = "1001:Movement is unable due to no carrier presence";
+            m_dicCancel[0x1002] = "1002:Improper setting";
+            m_dicCancel[0x1003] = "1003:Improper current position";
+            m_dicCancel[0x1004] = "1004:Movement is unable due to small designated position";
+            m_dicCancel[0x1005] = "1005:Movement is unable due to large designated position";
+            m_dicCancel[0x1006] = "1006:Presence of the adapter cannot be identified";
+            m_dicCancel[0x1007] = "1007:Origin search cannot be perfomed due to abnormal presence state of the adapter";
+            m_dicCancel[0x1008] = "1008:Adapter not prepared";
+            m_dicCancel[0x1009] = "1009:Cover not closed";
+            m_dicCancel[0x1100] = "1100:Emergency stop signal is ON";
+            m_dicCancel[0x1200] = "1200:Pause signal is On./Area sensor beam is blocked";
+            m_dicCancel[0x1300] = "1300:Interlock signal is ON";
+            m_dicCancel[0x1400] = "1400:Driver power is OFF";
+            m_dicCancel[0x2000] = "2000:No response from the ID reader/writer";
+            m_dicCancel[0x2100] = "2100:Command for the ID reader/writer is cancelled";
+
+            m_dicController[0x00] = "[00:Others] ";
+            m_dicController[0x01] = "[01:Y-axis] ";
+            m_dicController[0x02] = "[02:Z-axis] ";
+            m_dicController[0x03] = "[03:Lifting/Lowering mechanism for reading the carrier ID] ";
+            m_dicController[0x04] = "[04:Stage retaining mechanism] ";
+            m_dicController[0x05] = "[05:Rotation table] ";
+            m_dicController[0x0F] = "[06:Driver] ";
+
+            for (int i = 0; i < 0x10; i++)
+            {
+                m_dicController[0x10 + i] = string.Format("[{0:x2}:IO unit {1}] ", 0x10 + i, i + 1);
+            }
+
+            m_dicError[0x01] = "01:Motor stall";
+            m_dicError[0x02] = "02:Sensor abnormal";
+            m_dicError[0x03] = "03:Emergency stop";
+            m_dicError[0x04] = "04:Command error";
+            m_dicError[0x05] = "05:Communication error";
+            m_dicError[0x06] = "06:Chucking sensor abnormal";
+            m_dicError[0x07] = "07:(Reserved)";
+            m_dicError[0x08] = "08:Obstacle detection sensor error";
+            m_dicError[0x09] = "09:Second origin sensor abnormal";
+            m_dicError[0x0A] = "0A:Mapping sensor abnormal";
+            m_dicError[0x0B] = "0B:Wafer protrusion sensor abnormal";
+            m_dicError[0x0E] = "0E:Driver abnormal";
+            m_dicError[0x0F] = "0F:Power abnormal";
+            m_dicError[0x20] = "20:Control power abnormal";
+            m_dicError[0x21] = "21:Driver power abnormal";
+            m_dicError[0x22] = "22:EEPROM abnormal";
+            m_dicError[0x23] = "23:Z search abnormal";
+            m_dicError[0x24] = "24:Overheat";
+            m_dicError[0x25] = "25:Overcurrent";
+            m_dicError[0x26] = "26:Motor cable abnormal";
+            m_dicError[0x27] = "27:Motor stall (position deviation)";
+            m_dicError[0x28] = "28:Motor stall (time over)";
+            m_dicError[0x89] = "89:Exhaust fan abnormal";
+            m_dicError[0x92] = "92:FOUP clamp/rotation disabled";
+            m_dicError[0x93] = "93:FOUP unclamp/rotation disabled";
+            m_dicError[0x94] = "94:Latch key lock disabled";
+            m_dicError[0x95] = "95:(Reserved)";
+            m_dicError[0x96] = "96:Latch key release disabled";
+            m_dicError[0x97] = "97:Mapping sensor preparation disabled";
+            m_dicError[0x98] = "98:Mapping sensor containing disabled";
+            m_dicError[0x99] = "99:Chucking on disabled";
+            m_dicError[0x9A] = "9A:Wafer protrusion";
+            m_dicError[0x9B] = "9B:No cover on FOUP/With cover on FOSB";
+            m_dicError[0x9C] = "9C:Carrier improperly taken";
+            m_dicError[0x9D] = "9D:FSOB door detection";
+            m_dicError[0x9E] = "9E:Carrier improperly placed";
+            m_dicError[0xA0] = "A0:Cover lock disabled";
+            m_dicError[0xA1] = "A1:Cover unlock disabled";
+            m_dicError[0xB0] = "B0:TR_REQ timeout";
+            m_dicError[0xB1] = "B1:BUSY ON timeout";
+            m_dicError[0xB2] = "B2:Carrier carry-in timeout";
+            m_dicError[0xB3] = "B3:Carrier carry-out timeout";
+            m_dicError[0xB4] = "B4:BUSY OFF timeout";
+            m_dicError[0xB5] = "B5:(Reserved)";
+            m_dicError[0xB6] = "56:VALID OFF timeout";
+            m_dicError[0xB7] = "B7:CONTINUE timeout";
+            m_dicError[0xB8] = "B8:Signal abnormal detected from VALID,CS_0=ON to TR_REQ=ON";
+            m_dicError[0xB9] = "B9:Signal abnormal detected from TR_REQ=ON to BUSY=ON";
+            m_dicError[0xBA] = "BA:Signal abnormal detected from BUSY=ON to Placement=ON";
+            m_dicError[0xBB] = "BB:Signal abnormal detected from Placement=ON to COMPLETE=ON";
+            m_dicError[0xBC] = "BC:Signal abnormal detected from COMPLETE=ON to VALID=OFF";
+            m_dicError[0xBF] = "BF:VALID, CS_0 signal abnormal";
+
+            //==============================================================================
+            _dicCmdsTable = new Dictionary<enumTowerCommand, string>()
+            {
+                {enumTowerCommand.Orgn,"ORGN"},
+                {enumTowerCommand.Home,"HOME"},
+                {enumTowerCommand.Extend,"EXTD"},
+                {enumTowerCommand.Load,"LOAD"},
+                {enumTowerCommand.Unload,"UNLD"},
+
+                {enumTowerCommand.Clamp,"CLMP"},
+                {enumTowerCommand.UnClamp,"UCLM"},
+                {enumTowerCommand.Mapping,"WMAP"},
+                {enumTowerCommand.E84Load,"LOAD"},
+                {enumTowerCommand.E84UnLoad,"UNLD"},
+                {enumTowerCommand.SetEvent,"EVNT"},
+                {enumTowerCommand.Reset,"RSTA"},
+                {enumTowerCommand.Initialize,"INIT"},
+                {enumTowerCommand.Stop,"STOP"},
+                {enumTowerCommand.Pause,"PAUS"},
+                {enumTowerCommand.Mode,"MODE"},
+                {enumTowerCommand.Wtdt,"WTDT"},
+                {enumTowerCommand.GetData,"RTDT"},
+                {enumTowerCommand.TransferData,"TRDT"},
+                {enumTowerCommand.Speed,"SSPD"},
+                {enumTowerCommand.SetIO,"SPOT" },
+                {enumTowerCommand.Status,"STAT"},
+                {enumTowerCommand.GetIO,"GPIO"},
+                {enumTowerCommand.GetMappingData,"GMAP"},
+                {enumTowerCommand.GetVersion,"GVER"},
+                {enumTowerCommand.GetLog,"GLOG"},
+                {enumTowerCommand.SetDateTime,"STIM"},
+                {enumTowerCommand.GetDateTime,"GTIM"},
+                {enumTowerCommand.GetPos,"GPOS"},
+                {enumTowerCommand.GetType,"GWID" },
+                {enumTowerCommand.SetType,"SWID" },
+                {enumTowerCommand.ZaxStep,"ZAX1.STEP"},
+                {enumTowerCommand.ZaxHome,"ZAX1.HOME"},
+                {enumTowerCommand.YaxHome,"YAX1.HOME"},
+                {enumTowerCommand.GetDPRM,"DPRM.GTDT" },
+                {enumTowerCommand.SetDPRM,"DPRM.STDT" },
+                {enumTowerCommand.GetDMPR,"DMPR.GTDT" },
+                {enumTowerCommand.SetDMPR,"DMPR.STDT" },
+                {enumTowerCommand.GetDCST,"DCST.GTDT" },
+                {enumTowerCommand.SetDCST,"DCST.STDT" },
+                {enumTowerCommand.ReadID,"READ"},
+                {enumTowerCommand.WriteID,"WRIT"},
+                {enumTowerCommand.ClientConnected,"CNCT"},
+        };
+        }
+        #endregion
+
+        public SSTower(sServer Sever, string strIP, int nPortID, int nBodyNo, bool bDisable, bool bSimulate, string strWaferType)
+        {
+            Simulate = bSimulate;
+            Disable = bDisable;
+
+            BodyNo = nBodyNo;   //  1 2 3 4       
+
+            WaferType = (enumTowerWaferType)int.Parse(strWaferType);
+
+
+            for (int nCnt = 0; nCnt < (int)enumTowerCommand.Max; nCnt++)
+                _signalAck.Add((enumTowerCommand)nCnt, new SSignal(false, EventResetMode.ManualReset));
+
+            for (int i = 0; i < (int)enumTowerSignalTable.Max; i++)
+                _signals.Add((enumTowerSignalTable)i, new SSignal(false, EventResetMode.ManualReset));
+
+            _signals[enumTowerSignalTable.ProcessCompleted].Set();
+
+            m_Socket = new sRorzeSocket(strIP, nPortID, nBodyNo, "STK", bSimulate, Sever);
+
+
+            _threadInit = new SInterruptOneThread(ExeINIT);
+            _threadOrgn = new SInterruptOneThread(ExeORGN);
+            _threadReset = new SInterruptOneThreadINT(ExeRsta);
+            _threadMapping = new SInterruptOneThread(ExeWMAP);
+            _threadGetData = new SInterruptOneThread(ExeGetData);
+
+            _signalSubSequence = new SSignal(false, EventResetMode.ManualReset);
+
+
+            _pollingAuto = new SPollingThread(1);
+            _pollingAuto.DoPolling += _pollingAuto_DoPolling;
+
+            _exePolling = new SPollingThread(1);
+            _exePolling.DoPolling += _exePolling_DoPolling;
+
+            if (Simulate)
+            {
+                m_gpio = new TowerGPIO("000000000000000", "000000000000000");
+            }
+
+            if (!Disable)
+            {
+                _exePolling.Set();
+            }
+
+            CreateMessage();
+        }
+
+        private void WriteLog(string strMsg, [CallerLineNumber] int lineNumber = 0, [CallerMemberName] string caller = null)
+        {
+            try
+            {
+                strMsg = strMsg + " at line " + lineNumber + " (" + caller + ")";
+                m_logger.WriteLog("[STK{0}] : {1}", this.BodyNo, strMsg);
+            }
+            catch (Exception ex)
+            {
+                strMsg = ex + " at line " + lineNumber + " (" + caller + ")";
+                m_logger.WriteLog("[STK{0}] : {1}", this.BodyNo, strMsg);
+            }
+        }
+
+        #region AutoProcess
+        public void AutoProcessStart()
+        {
+            ProcessStart = true;
+            this._pollingAuto.Set();
+
+            OnProcessStart?.Invoke(this, new EventArgs());
+        }
+        public void AutoProcessEnd()
+        {
+            _pollingAuto.Reset();
+            ProcessStart = false;
+        }
+        private void _pollingAuto_DoPolling()
+        {
+            try
+            {
+                DoAutoProcessing?.Invoke(this, this);
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+                _pollingAuto.Reset();//停止自動流程
+                OnProcessAbort?.Invoke(this, new EventArgs());
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+                _pollingAuto.Reset();//停止自動流程
+                OnProcessAbort?.Invoke(this, new EventArgs());
+            }
+        }
+        #endregion
+        #region 處理TCP接收到的內容
+        private void _exePolling_DoPolling()
+        {
+            try
+            {
+                int Emptycount = 0;
+                string[] astrFrame;
+
+                if (!m_Socket.QueRecvBuffer.TryDequeue(out astrFrame)) return;
+                string strFrame;
+
+                OnReadData?.Invoke(this, new MessageEventArgs(astrFrame));
+
+                for (int nCnt = 0; nCnt < astrFrame.Count(); nCnt++) //只處理第一個封包 2014.11.24
+                {
+                    if (astrFrame[nCnt].Length == 0)
+                    {
+                        Emptycount += 1;
+
+                        continue;
+                    }
+
+                    strFrame = astrFrame[nCnt];
+
+                    enumTowerCommand cmd = enumTowerCommand.GetVersion;
+                    bool bUnknownCmd = true;
+
+                    foreach (string scmd in _dicCmdsTable.Values) //查字典
+                    {
+                        if (strFrame.Contains(string.Format("STG{0}.{1}", this.BodyNo.ToString("X"), scmd)))
+                        {
+                            cmd = _dicCmdsTable.FirstOrDefault(x => x.Value == scmd).Key;
+                            bUnknownCmd = false; //認識這個指令
+                            break;
+                        }
+                    }
+
+                    if (bUnknownCmd) //不認識的封包
+                    {
+                        WriteLog(string.Format("Got unknown frame and pass to process.[{0}]", strFrame));
+                        continue;
+                    }
+
+                    WriteLog(string.Format("Receive : [{0}]", strFrame));
+
+                    switch (strFrame[0]) //命令種類
+                    {
+                        case 'c': //cancel
+                            OnCancelAck(this, new TowerProtoclEventArgs(strFrame));
+                            break;
+                        case 'n': //nak
+                            _signalAck[cmd].bAbnormalTerminal = true;
+                            _signalAck[cmd].Set();
+                            break;
+                        case 'a': //ack
+                            OnAck(this, new TowerProtoclEventArgs(strFrame));
+                            _signalAck[cmd].Set();
+                            break;
+                        case 'e':
+                            OnAck(this, new TowerProtoclEventArgs(strFrame));
+                            break;
+                        default:
+
+                            break;
+                    }
+
+                }
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        void OnAck(object sender, TowerProtoclEventArgs e)
+        {
+            enumTowerCommand cmd = _dicCmdsTable.FirstOrDefault(x => x.Value == e.Frame.Command).Key;
+
+            switch (cmd)
+            {
+                case enumTowerCommand.GetMappingData:
+                    AssignGMAP(e.Frame.Value);
+                    break;
+                case enumTowerCommand.Status:
+                    AnalysisStatus(e.Frame.Value);
+                    break;
+                case enumTowerCommand.GetIO:
+                    AnalysisGPIO(e.Frame.Value);
+                    break;
+                case enumTowerCommand.GetPos:
+                    AnalysisGPOS(e.Frame.Value);
+                    break;
+                case enumTowerCommand.GetVersion:
+                    break;
+                case enumTowerCommand.GetDateTime:
+                    break;
+                case enumTowerCommand.ClientConnected:
+                    _signalAck[cmd].Set();
+                    Connected = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        void OnCancelAck(object sender, TowerProtoclEventArgs e)
+        {
+            enumTowerCommand cmd = _dicCmdsTable.FirstOrDefault(x => x.Value == e.Frame.Command).Key;
+            AnalysisCancel(e.Frame.Value);
+        }
+        private void AssignGMAP(string strFrame)
+        {
+            MappingData = strFrame;
+        }
+        private void AnalysisStatus(string strFrame)
+        {
+            try
+            {
+                if (!strFrame.Contains('/'))
+                {
+                    WriteLog(string.Format("The format of STAT has error, [{0}]", strFrame));
+                    return;
+                }
+                string[] str = strFrame.Split('/');
+                string s1 = str[0];
+                string s2 = str[1];
+
+                //S1.bit#1 operation mode
+                switch (s1[0])
+                {
+                    case '0':
+                        m_eStatMode = enumTowerMode.Initializing;
+                        break;
+                    case '1':
+                        m_eStatMode = enumTowerMode.Remote;
+                        _signals[enumTowerSignalTable.Remote].Set();
+                        break;
+                    case '2':
+                        m_eStatMode = enumTowerMode.Maintenance;
+                        _signals[enumTowerSignalTable.Remote].Set();
+                        break;
+                    case '3':
+                        m_eStatMode = enumTowerMode.Recovery;
+                        break;
+                    default: break;
+                }
+
+                //S1.bit#2 origin return complete
+                if (s1[1] == '0') _signals[enumTowerSignalTable.OPRCompleted].Reset();
+                else _signals[enumTowerSignalTable.OPRCompleted].Set();
+                m_bStatOrgnComplete = s1[1] == '1';
+
+                //S1.bit#3 processing command
+                if (s1[2] == '0') _signals[enumTowerSignalTable.ProcessCompleted].Set();
+                else _signals[enumTowerSignalTable.ProcessCompleted].Reset();
+                m_bStatProcessed = s1[2] == '1';
+
+                //S1.bit#4 operation status
+                switch (s1[3])
+                {
+                    case '0': m_eStatInPos = enumTowerStatus.InPos; break;
+                    case '1': m_eStatInPos = enumTowerStatus.Moving; break;
+                    case '2': m_eStatInPos = enumTowerStatus.Pause; break;
+                }
+
+                //S1.bit#5 operation speed
+                if (s1[4] >= '0' && s1[4] <= '9') m_nSpeed = s1[4] - '0';
+                else if (s1[4] >= 'A' && s1[4] <= 'K') m_nSpeed = s1[4] - 'A' + 10;
+                if (m_nSpeed == 0) m_nMotionTimeout = 60000;
+                else m_nMotionTimeout = 60000 * 3;
+
+                //S2
+                if (Convert.ToInt32(s2, 16) > 0)
+                {
+                    _signals[enumTowerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    _signals[enumTowerSignalTable.MotionCompleted].Set();
+                    SendAlmMsg(s2);
+                    m_strErrCode = s2;
+                }
+                else
+                {
+                    if (m_eStatInPos == enumTowerStatus.InPos)//運動到位               
+                        _signals[enumTowerSignalTable.MotionCompleted].Set();
+                    else
+                        _signals[enumTowerSignalTable.MotionCompleted].Reset();
+
+                    if (m_strErrCode != "0000")
+                    {
+                        RestAlmMsg(m_strErrCode);
+                        m_strErrCode = "0000";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void AnalysisCancel(string strFrame)
+        {
+            try
+            {
+                if (Convert.ToInt32(strFrame, 16) > 0)
+                {
+                    _signals[enumTowerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    _signals[enumTowerSignalTable.MotionCompleted].Set(); //有moving過才可以Set
+                    SendCancelMsg(strFrame);
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void AnalysisGPIO(string strFrame)
+        {
+            try
+            {
+                if (!strFrame.Contains('/'))
+                {
+                    WriteLog(string.Format("The format of GPIO has error, [{0}]", strFrame));
+                    return;
+                }
+                m_gpio = new TowerGPIO(strFrame.Split('/')[0], strFrame.Split('/')[1]);
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void AnalysisGPOS(string strFrame)
+        {
+            try
+            {
+                if (!strFrame.Contains('/'))
+                {
+                    return;
+                }
+                else
+                {
+                    m_nRaxisPos = int.Parse(strFrame.Split('/')[0]);
+                    m_nZaxisPos = int.Parse(strFrame.Split('/')[1]);
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        #endregion
+        #region OneThread 
+        public void INIT() { _threadInit.Set(); }
+        public void ORGN() { _threadOrgn.Set(); }
+        public void RSTA(int nNum) { _threadReset.Set(nNum); }
+        public void WMAP() { _threadMapping.Set(); }
+        public void GetData() { _threadGetData.Set(); }
+        //==============================================================================
+        private void ExeINIT()
+        {
+            try
+            {
+                WriteLog(string.Format("ExeINIT Start"));
+                this.InitW(m_nAckTimeout);
+                SpinWait.SpinUntil(() => false, 1000);
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void ExeORGN()
+        {
+            try
+            {
+                WriteLog(string.Format("ExeORGN Start"));
+
+                this.ResetChangeModeCompleted();
+                this.EventW(m_nAckTimeout);
+                this.WaitChangeModeCompleted(m_nAckTimeout);
+
+                this.ResetChangeModeCompleted();
+                this.InitW(m_nAckTimeout);
+                this.WaitChangeModeCompleted(m_nAckTimeout);
+
+                this.StimW(m_nAckTimeout);
+
+                this.ResetInPos();
+                this.OrgnW(m_nAckTimeout);
+                this.WaitInPos(m_nMotionTimeout);
+
+                OnORGNComplete?.Invoke(this, true);
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+                OnORGNComplete?.Invoke(this, false);
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+                OnORGNComplete?.Invoke(this, false);
+            }
+        }
+        private void ExeRsta(int nMode)
+        {
+            try
+            {
+                WriteLog(string.Format("ExeRsta Start"));
+                this.ResetW(m_nAckTimeout, nMode);
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void ExeWMAP()
+        {
+            try
+            {
+                WriteLog(string.Format("ExeWMAP Start"));
+
+                this.ResetInPos();
+                //this.WmapW(m_nAckTimeout);
+                this.WaitInPos(m_nMotionTimeout);
+                this.GmapW(m_nAckTimeout);
+
+                OnMappingComplete?.Invoke(this, new TowerGMAP_EventArgs(_MappingData, BodyNo));
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+            }
+        }
+        private void ExeGetData()
+        {
+            try
+            {
+                WriteLog(string.Format("ExeGetData Start"));
+
+                //預留
+
+                OnGetDataComplete?.Invoke(this, true);
+            }
+            catch (SException ex)
+            {
+                WriteLog(string.Format("SException : {0}", ex));
+                OnGetDataComplete?.Invoke(this, false);
+            }
+            catch (Exception ex)
+            {
+                WriteLog(string.Format("Exception : {0}", ex));
+                OnGetDataComplete?.Invoke(this, false);
+            }
+        }
+        #endregion
+        //=======================================================================
+        #region =========================== ORGN =======================================
+        private void Orgn(int nVariable)
+        {
+            _signalAck[enumTowerCommand.Orgn].Reset();
+            m_Socket.SendCommand(string.Format("ORGN(" + nVariable + ")"));
+        }
+        public void OrgnW(int nTimeout, int nVariable = 0)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Orgn;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Orgn(nVariable);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _Waferlist = new List<SWafer>();
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== HOME =======================================
+        private void Home(int nStg, int nSlot, int nFlag)
+        {
+            _signalAck[enumTowerCommand.Home].Reset();
+            m_Socket.SendCommand(string.Format("HOME({0},{1},{2})", nStg, nSlot, nFlag));
+        }
+        public void HomeW(int nTimeout, int nStg, int nSlot, int nFlag)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Home;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Home(nStg, nSlot, nFlag);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== EXTD =======================================
+        private void Extd(int nStg, int nSlot)
+        {
+            _signalAck[enumTowerCommand.Extend].Reset();
+            m_Socket.SendCommand(string.Format("EXTD({0},{1})", nStg, nSlot));
+        }
+        public void ExtdW(int nTimeout, int nStg, int nSlot)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Extend;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Extd(nStg, nSlot);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== LOAD =======================================
+        private void Load(int nStg, int nSlot)
+        {
+            _signalAck[enumTowerCommand.Load].Reset();
+            m_Socket.SendCommand(string.Format("Load({0},{1})", nStg, nSlot));
+        }
+        public void LoadW(int nTimeout, int nStg, int nSlot)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Load;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Load(nStg, nSlot);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== UNLD =======================================
+        private void Unld(int nFlg)
+        {
+            _signalAck[enumTowerCommand.Unload].Reset();
+            m_Socket.SendCommand(string.Format("Unld({0})", nFlg));
+        }
+        public void UnldW(int nTimeout, int nFlg)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Unload;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Unld(nFlg);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== CLMP =======================================
+        private void Clmp()
+        {
+            _signalAck[enumTowerCommand.Clamp].Reset();
+            m_Socket.SendCommand(string.Format("CLMP"));
+        }
+        public void ClmpW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Clamp;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Clmp();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== UCLM =======================================
+        private void Uclm()
+        {
+            _signalAck[enumTowerCommand.UnClamp].Reset();
+            m_Socket.SendCommand(string.Format("UCLM"));
+        }
+        public void UclmW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.UnClamp;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Uclm();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== WMAP =======================================
+        private void Wmap(int nStg, int nId, int nFlag)
+        {
+            _signalAck[enumTowerCommand.Mapping].Reset();
+            m_Socket.SendCommand(string.Format("WMAP({0},{1},{2})", nStg, nId, nFlag));
+        }
+        public void WmapW(int nTimeout, int nStg, int nId, int nFlag)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Mapping;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                _signals[enumTowerSignalTable.MotionCompleted].Reset();
+                Wmap(nStg, nId, nFlag);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+
+        #region =========================== EVNT =======================================
+        private void Event()
+        {
+            _signalAck[enumTowerCommand.SetEvent].Reset();
+            m_Socket.SendCommand("EVNT(0,1)");
+        }
+        public void EventW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.SetEvent;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Event();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== RSTA =======================================
+        private void Reset(int nReset)
+        {
+            _signalAck[enumTowerCommand.Reset].Reset();
+            m_Socket.SendCommand(string.Format("RSTA(" + nReset + ")"));
+        }
+        public void ResetW(int nTimeout, int nReset = 0)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Reset;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Reset(nReset);
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== INIT =======================================
+        private void Init()
+        {
+            _signalAck[enumTowerCommand.Initialize].Reset();
+            m_Socket.SendCommand(string.Format("INIT"));
+        }
+        public void InitW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Initialize;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Init();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== STOP =======================================
+        private void Stop()
+        {
+            _signalAck[enumTowerCommand.Stop].Reset();
+            m_Socket.SendCommand(string.Format("STOP"));
+        }
+        public void StopW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Stop;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Stop();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== PAUS =======================================
+        private void Paus()
+        {
+            _signalAck[enumTowerCommand.Pause].Reset();
+            m_Socket.SendCommand(string.Format("PAUS"));
+        }
+        public void PausW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Pause;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Paus();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== MODE =======================================
+        private void Mode()
+        {
+            _signalAck[enumTowerCommand.Mode].Reset();
+            m_Socket.SendCommand(string.Format("MODE"));
+        }
+        public void ModeW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Mode;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Mode();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            else
+            {
+
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+
+        #region =========================== STAT =======================================
+        private void Stat()
+        {
+            _signalAck[enumTowerCommand.Status].Reset();
+            m_Socket.SendCommand(string.Format("STAT"));
+        }
+        public void StatW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.Status;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Stat();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== GPIO =======================================
+        private void Gpio()
+        {
+            _signalAck[enumTowerCommand.GetIO].Reset();
+            m_Socket.SendCommand(string.Format("GPIO"));
+        }
+        public void GpioW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.GetIO;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Gpio();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== GMAP =======================================
+        private void Gmap()
+        {
+            _signalAck[enumTowerCommand.GetIO].Reset();
+            m_Socket.SendCommand(string.Format("GMAP"));
+        }
+        public void GmapW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.GetMappingData;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Gmap();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== GVER =======================================
+        private void Gver()
+        {
+            _signalAck[enumTowerCommand.GetIO].Reset();
+            m_Socket.SendCommand(string.Format("GVER"));
+        }
+        public void GverW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.GetVersion;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Gver();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== GLOG =======================================
+        private void Glog()
+        {
+            _signalAck[enumTowerCommand.GetLog].Reset();
+            m_Socket.SendCommand(string.Format("GLOG"));
+        }
+        public void GlogW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.GetLog;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Glog();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+        #region =========================== STIM =======================================
+        private void Stim()
+        {
+            _signalAck[enumTowerCommand.SetDateTime].Reset();
+            m_Socket.SendCommand("STIM(" + DateTime.Now.ToString("yyyy, MM, dd, HH, mm, ss") + ")");
+        }
+        public void StimW(int nTimeout)
+        {
+            enumTowerCommand eComand = enumTowerCommand.SetDateTime;
+            _signalSubSequence.Reset();
+            if (!Simulate)
+            {
+                Stim();
+                if (!_signalAck[eComand].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.AckTimeout);
+                    throw new SException((int)enumTowerCustomError.AckTimeout, string.Format("Send command and wait Ack was timeout. [{0}]", _dicCmdsTable[eComand]));
+                }
+                if (_signalAck[eComand].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.SendCommandFailure);
+                    throw new SException((int)enumTowerCustomError.SendCommandFailure, string.Format("Send command and wait Ack was failure. [{0}]", _dicCmdsTable[eComand]));
+                }
+            }
+            _signalSubSequence.Set();
+        }
+        #endregion =====================================================================
+
+
+        public void ResetChangeModeCompleted()
+        {
+            _signals[enumTowerSignalTable.Remote].Reset();
+        }
+        public void WaitChangeModeCompleted(int nTimeout)
+        {
+            if (!Simulate)
+            {
+                if (!_signals[enumTowerSignalTable.Remote].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.InitialFailure);
+                    throw new SException((int)enumTowerCustomError.InitialFailure, string.Format("Wait Mode was timeout. [Timeout = {0} ms]", nTimeout));
+                }
+                if (_signals[enumTowerSignalTable.Remote].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.InitialFailure);
+                    throw new SException((int)enumTowerCustomError.InitialFailure, string.Format("Motion is Mode end."));
+                }
+            }
+        }
+        public void ResetProcessCompleted()
+        {
+            _signals[enumTowerSignalTable.ProcessCompleted].Reset();
+            m_bStatProcessed = true;
+        }
+        public void WaitProcessCompleted(int nTimeout)
+        {
+            if (!Simulate)
+            {
+                if (!_signals[enumTowerSignalTable.ProcessCompleted].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.ProcessFlagTimeout);
+                    throw new SException((int)enumTowerCustomError.ProcessFlagTimeout, string.Format("Wait process flag complete was timeout. [Timeout = {0} ms]", nTimeout));
+                }
+                if (_signals[enumTowerSignalTable.ProcessCompleted].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.ProcessFlagAbnormal);
+                    throw new SException((int)enumTowerCustomError.ProcessFlagAbnormal, string.Format("Wait process flag complete was failure. [Timeout = {0} ms]", nTimeout));
+                }
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 500);
+            }
+        }
+        public void ResetInPos()
+        {
+            _signals[enumTowerSignalTable.MotionCompleted].Reset();
+            m_bMoving = true;
+        }
+        public void WaitInPos(int nTimeout)
+        {
+            if (!Simulate)
+            {
+                //motion complete
+                if (!_signals[enumTowerSignalTable.MotionCompleted].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumTowerCustomError.MotionTimeout);
+                    throw new SException((int)enumTowerCustomError.MotionTimeout, string.Format("Wait motion complete was timeout. [Timeout = {0} ms]", nTimeout));
+                }
+                if (_signals[enumTowerSignalTable.MotionCompleted].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumTowerCustomError.MotionAbnormal);
+                    throw new SException((int)enumTowerCustomError.MotionAbnormal, string.Format("Wait process flag complete was failure. [Timeout = {0} ms]", nTimeout));
+                }
+                m_bMoving = false;
+            }
+            else
+            {
+                m_bMoving = false;
+                SpinWait.SpinUntil(() => false, 500);
+            }
+        }
+    }
+}

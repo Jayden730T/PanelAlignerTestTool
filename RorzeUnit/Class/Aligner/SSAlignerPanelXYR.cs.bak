@@ -1,0 +1,2081 @@
+﻿
+using RorzeComm;
+using RorzeComm.Log;
+using RorzeComm.Threading;
+using RorzeUnit.Class.Agito;
+using RorzeUnit.Class.Aligner.Enum;
+using RorzeUnit.Class.Aligner.Event;
+using RorzeUnit.Class.Camera;
+using RorzeUnit.Class.RC500.RCEnum;
+using RorzeUnit.Event;
+using RorzeUnit.Interface;
+using RorzeUnit.Net.Sockets;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading;
+using System.Windows;
+using static RorzeUnit.Class.Agito.SSAGD301_Motion;
+using static RorzeUnit.Class.SWafer;
+
+namespace RorzeUnit.Class.Aligner
+{
+    public class SSAlignerPanelXYR : I_Aligner
+    {
+        private bool m_bSimulate;
+        private enumAlignerMode m_eStatMode;        //記憶的STAT S1第1 bit  
+        private bool m_bStatOrgnComplete;           //記憶的STAT S1第2 bit
+        private bool m_bStatProcessed;              //記憶的STAT S1第3 bit
+        private enumAlignerStatus m_eStatInPos;     //記憶的STAT S1第4 bit   
+        private int m_nSpeed;                       //記憶的STAT S1第5 bit     
+        private string m_strErrCode = "0000";       //記憶的STAT S2
+        private bool m_bIsError = false;
+
+        private SLogger m_Logger = SLogger.GetLogger("CommunicationLog");
+        private SLogger m_ALNLogger;
+        private SSCamera m_Camera;
+        private SWafer m_Wafer;
+
+        private int m_nAckTimeout = 3000;
+        private int m_nMotionTimeout = 60000;
+        private bool m_bAlignmentStart = false;
+        private bool m_bProcessStart = false;
+        private bool m_bRobotExtend = false;
+        private bool m_bPanelExistUseVac =false;
+
+        SSAGD301_Motion m_Motion;
+
+        public virtual bool Connected { get; private set; }
+        public int BodyNo { get; private set; }
+        public bool Disable { get; private set; }
+        public bool AlignmentStart { get { return m_bAlignmentStart; } set { m_bAlignmentStart = value; } }
+        public bool ProcessStart { get { return m_bProcessStart; } set { m_bProcessStart = value; } }
+        public int Xaxispos { get { return m_Motion.Axis3Pos; } protected set { } }
+        public int Yaxispos { get { return m_Motion.Axis2Pos; } protected set { } }
+        public int Zaxispos { get { return 0; } protected set { } }
+        public int Raxispos { get { return m_Motion.Axis1Pos; } protected set { } }
+        public ConcurrentQueue<SWafer> queCommand { get; set; }
+        public ConcurrentQueue<SWafer> quePreCommand { get; set; }
+        public SWafer Wafer
+        {
+            get { return m_Wafer; }
+            set
+            {
+                m_Wafer = value;
+
+                Aligner_WaferChange?.Invoke(this, new WaferDataEventArgs(m_Wafer));  //  更新UI  //  更新UI
+
+                if (m_Wafer == null)
+                {
+                    CheckWaferExisClampVacuum(true);//Panel拿走後更新Panel exist狀態
+                    return;
+                }
+
+                OnAssignWaferData?.Invoke(this, new WaferDataEventArgs(m_Wafer));
+            }
+        }
+        public SRA320GPIO GPIO { get; protected set; }
+        public bool IsRobotExtend { get { return m_bRobotExtend; } }
+        public bool SetRobotExtend { set { m_bRobotExtend = value; } }
+        public enumWaferSize WaferType { get; } = enumWaferSize.Panel;
+        //STAT S1第1 bit
+        //public enumAlignerMode StatMode { get { return m_eStatMode; } }
+        //public bool IsInitialized { get { return m_eStatMode == enumAlignerMode.Remote; } }
+        //STAT S1第2 bit
+        public bool IsOrgnComplete { get { return m_Motion.IsOrgnComplete; } }
+        //STAT S1第3 bit
+        //public bool IsProcessing { get { return m_bStatProcessed; } }
+        //STAT S1第4 bit
+        //public enumAlignerStatus InPos { get { return m_eStatInPos; } }
+        public bool IsMoving { get { return m_eStatInPos == enumAlignerStatus.Moving; } }
+        //STAT S1第5 bit
+        //public int GetSpeed { get { return m_nSpeed; } }
+        //STAT S2
+        public bool IsError 
+        { 
+            get 
+            {
+                if (m_bIsError == false)
+                    return m_Motion.IsError /*|| m_Camera.IsError*/;
+                else
+                    return m_bIsError;
+            } 
+        }
+
+
+        public dlgv_wafer AssignToRobotQueue { get; set; }//丟給robot作排程
+
+        #region =========================== Event ==============================================
+        public event EventHandler<WaferDataEventArgs> OnAssignWaferData;
+        public event EventHandler<WaferDataEventArgs> Aligner_WaferChange;  //  更新UI
+        public event EventHandler<WaferDataEventArgs> OnAligCompelet;  //  alig end 
+
+        public event EventHandler<bool> OnManualCompleted;
+        public event EventHandler<bool> OnORGNComplete;
+        public event EventHandler<bool> OnRot1StepComplete;
+
+        public event EventHandler OnProcessStart;
+        public event EventHandler OnProcessEnd;
+        public event EventHandler OnProcessAbort;
+
+        public event MessageEventHandler OnReadData;
+
+        public event AutoProcessingEventHandler DoManualProcessing;
+        public event AutoProcessingEventHandler DoAutoProcessing;
+
+        public event OccurErrorEventHandler OnOccurStatErr;
+        public event OccurErrorEventHandler OnOccurCancel;
+        public event OccurErrorEventHandler OnOccurCustomErr;
+        public event OccurErrorEventHandler OnOccurErrorRest;
+        public event OccurErrorEventHandler OnOccurWarning;
+        public event OccurErrorEventHandler OnOccurWarningRest;
+
+        #endregion
+
+        #region =========================== Thread =============================================
+        private SInterruptOneThread _threadManualFunc;
+        private SInterruptOneThread _threadOrgn;             //原點復歸控制
+        private SInterruptOneThreadINT_INT _threadHome;      //
+        private SInterruptOneThread _threadClmp;          //
+        private SInterruptOneThread _threadUclm;          //
+        private SInterruptOneThreadINT _threadAlgn;          //
+        private SInterruptOneThread _threadAlgn1;            //
+        private SInterruptOneThreadINT _threadRot1Extd;      //
+        private SInterruptOneThreadINT _threadRot1Step;      //
+        private SInterruptOneThread _threadStop;             //
+        private SInterruptOneThread _threadPause;            //
+        private SInterruptOneThreadINT _threadMode;          //
+        private SInterruptOneThread _threadWtdt;             //
+        private SInterruptOneThreadINT _threadSspd;          //
+        private SInterruptOneThread _threadGver;             //
+        private SInterruptOneThreadINT _threadSsiz;          //
+        private SInterruptOneThread _threadGsiz;             //
+        private SInterruptOneThreadINT _threadReset;         //異常復歸控制
+        private SInterruptOneThread _threadInit;             //初始化控制(private 流程, 問Status/機況同步)
+        private SPollingThread _pollingAuto;                 //自動流程控管   
+        private SPollingThread _exePolling;
+        #endregion
+
+        #region =========================== Signals ============================================
+        //protected Dictionary<enumAlignerCommand, SSignal> m_SignalAck = new Dictionary<enumAlignerCommand, SSignal>();
+        protected Dictionary<enumAlignerSignalTable, SSignal> m_Signals = new Dictionary<enumAlignerSignalTable, SSignal>();
+        protected SSignal m_SignalSubSequence;
+        #endregion
+
+        #region =========================== CreateMessage ======================================
+        public Dictionary<int, string> m_dicCancel { get; } = new Dictionary<int, string>();
+        public Dictionary<int, string> m_dicController { get; } = new Dictionary<int, string>();
+        public Dictionary<int, string> m_dicError { get; } = new Dictionary<int, string>();
+        void CreateMessage()
+        {
+
+        }
+        #endregion
+
+
+        public SSAlignerPanelXYR(int nBodyNo, bool bDisable, bool bSimulate)
+        {
+            BodyNo = nBodyNo;
+            Disable = bDisable;
+            m_bSimulate = bSimulate;
+            m_bIsError = false;
+            m_ALNLogger = SLogger.GetLogger($"ALN{nBodyNo}");
+            for (int i = 0; i < (int)enumAlignerSignalTable.Max; i++)
+                m_Signals.Add((enumAlignerSignalTable)i, new SSignal(false, EventResetMode.ManualReset));
+            m_Signals[enumAlignerSignalTable.ProcessCompleted].Set();
+            m_SignalSubSequence = new SSignal(false, EventResetMode.ManualReset);
+            if (bSimulate == false)
+            {
+                m_Motion = new SSAGD301_Motion(BodyNo, bSimulate);
+                //return motion complete event
+                m_Motion.SetSignal(m_Signals, m_SignalSubSequence);
+                //m_Camera = new SSCamera();
+            }
+          _threadOrgn = new SInterruptOneThread(ExeORGN);             //原點復歸控制
+          //_threadHome = new SInterruptOneThread(ExeHOME);      //
+            _threadClmp = new SInterruptOneThread(ExeClmp);          //
+            _threadUclm = new SInterruptOneThread(ExeUclm);          //
+            _threadAlgn = new SInterruptOneThreadINT(ExeAlgn);          //
+            _threadAlgn1 = new SInterruptOneThread(ExeAlgn1);            //
+            _threadRot1Extd = new SInterruptOneThreadINT(ExeRot1Extd);      //
+            _threadRot1Step = new SInterruptOneThreadINT(ExeRot1Step);      //
+            _threadStop = new SInterruptOneThread(ExeStop);             //
+            //_threadPause = new SInterruptOneThread();            //
+            //_threadMode = new SInterruptOneThread();          //
+            //_threadWtdt = new SInterruptOneThread();             //
+            //_threadSspd = new SInterruptOneThread();          //
+            //_threadGver = new SInterruptOneThread();             //
+            //_threadSsiz = new SInterruptOneThread();          //
+            //_threadGsiz = new SInterruptOneThread();             //
+            _threadReset = new SInterruptOneThreadINT(ExeRsta);         //異常復歸控制
+            _threadInit = new SInterruptOneThread(ExeInit);             //初始化控制(private 流程, 問Status/機況同步)
+            //_pollingAuto = new SInterruptOneThread();                 //自動流程控管   
+            //_exePolling = new SInterruptOneThread();
+        }
+
+        private void WriteLog(string strContent, [CallerMemberName] string meberName = null, [CallerLineNumber] int lineNumber = 0)
+        {
+            string strMsg = string.Format("[ALN{0}] : {1}  at line {2} ({3})", BodyNo, strContent, lineNumber, meberName);
+            m_Logger.WriteLog(strMsg);
+        }
+
+        public void Open() { }
+
+        //==============================================================================
+
+        #region Auto Process
+        private void _pollingAuto_DoPolling() //  自動流程
+        {
+            try
+            {
+                if (DoAutoProcessing != null) DoAutoProcessing(this);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> DoAutoProcessing thread:" + ex);
+                _pollingAuto.Reset(); //停止自動流程
+
+                if (OnProcessAbort != null)
+                    OnProcessAbort(this, new EventArgs());
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> DoAutoProcessing thread:" + ex);
+                _pollingAuto.Reset();
+
+                if (OnProcessAbort != null)
+                    OnProcessAbort(this, new EventArgs());
+            }
+        }
+        
+
+        public void AutoProcessStart()
+        {
+            m_bProcessStart = true;
+            this._pollingAuto.Set();
+            if (OnProcessStart != null) OnProcessStart(this, new EventArgs());
+        }
+        public void AutoProcessEnd()
+        {
+            _pollingAuto.Reset();
+            m_bProcessStart = false;
+            if (OnProcessEnd != null) OnProcessEnd(this, new EventArgs());
+        }
+        public void AligCompelet(SWafer wafer)
+        {
+            wafer.AlgnComplete = true;
+            if (OnAligCompelet != null)
+                OnAligCompelet(this, new WaferDataEventArgs(wafer));
+        }
+        public void AssignQueue(SWafer wafer)
+        {
+            quePreCommand.Enqueue(wafer);
+        }
+
+        public void Cleanjobschedule()//20240704
+        {
+            queCommand = new System.Collections.Concurrent.ConcurrentQueue<SWafer>();
+            quePreCommand = new System.Collections.Concurrent.ConcurrentQueue<SWafer>();
+        }
+        #endregion
+
+        #region OneThread
+        public void StartManualFunction() { _threadManualFunc.Set(); }
+        public void ORGN() { _threadOrgn.Set(); }
+        public void HOME() { /*_threadHome.Set();*/ }
+        public void CLMP() { _threadClmp.Set(); }
+        public void UCLM() { _threadUclm.Set(); }
+        public void ALGN(int nNum) { _threadAlgn.Set(nNum); }
+        public void ALGN1() { _threadAlgn1.Set(); }
+        public void Rot1EXTD(int nPos) { _threadRot1Extd.Set(nPos); }
+        public void Rot1STEP(int nPos) { _threadRot1Step.Set(nPos); }
+        public void RSTA(int nNum) { _threadReset.Set(nNum); }
+        public void INIT() { _threadInit.Set(); }
+        public void STOP() { _threadStop.Set(); }
+        public void PAUS() { /*_threadPause.Set(); */}
+        public void MODE(int nNum) {/* _threadMode.Set(nNum);*/ }
+        public void WTDT() { /*_threadWtdt.Set(); */}
+        public void SSPD(int nNum) {/* _threadSspd.Set(nNum);*/ }
+        public void SSIZ(int nNum) {/* _threadSsiz.Set(nNum); */}
+        public void GSIZ() {/* _threadGsiz.Set(); */}
+        //==============================================================================
+        void ExeManualFunction()
+        {
+            try
+            {
+                WriteLog("ExeManualFunction:Start");
+                m_Signals[enumAlignerSignalTable.ProcessCompleted].Reset();
+                if (DoManualProcessing != null) DoManualProcessing(this);
+                OnManualCompleted?.Invoke(this, true);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+                OnManualCompleted?.Invoke(this, false);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+                OnManualCompleted?.Invoke(this, false);
+            }
+            DoManualProcessing = null;
+
+        }
+        protected virtual void ExeORGN()
+        {
+            try
+            {
+                WriteLog("ExeORGN:Start");
+                this.ResetInPos();
+
+                ResetW(3000, 1);
+                this.ResetChangeModeCompleted();
+                this.InitW(3000);
+
+                this.ResetOrgnSinal();
+                this.ResetInPos();
+                this.OrgnW(30000, 2);
+                this.WaitInPos(120000);
+                this.WaitOrgnCompleted(120000);
+
+                SpinWait.SpinUntil(() => false, 500);
+
+                Cleanjobschedule();
+
+                OnORGNComplete?.Invoke(this, true);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+                OnORGNComplete?.Invoke(this, false);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+                OnORGNComplete?.Invoke(this, false);
+            }
+        }
+        //void ExeHome(int n1, int n2)
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeHome:Start");
+        //        this.HomeW(3000, n1, n2);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        void ExeClmp()
+        {
+            try
+            {
+                WriteLog("ExeClmp:Start");
+                this.ResetInPos();
+                this.ClmpW(3000);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeUclm()
+        {
+            try
+            {
+                WriteLog("ExeUclm:Start");
+                this.ResetInPos();
+                this.UclmW(3000);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeAlgn(int nMode)
+        {
+            try
+            {
+                WriteLog("ExeAlgn:Start");
+                this.ResetInPos();
+                this.AlgnW(3000, nMode);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeAlgn(int nMode, int nPos)
+        {
+            try
+            {
+                this.ResetInPos();
+                this.AlgnW(3000, nMode, nPos);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeAlgn1()
+        {
+            try
+            {
+                WriteLog("ExeAlgn1:Start");
+                this.ResetInPos();
+                this.Algn1W(3000);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeRot1Extd(int nPos)
+        {
+            try
+            {
+                WriteLog("ExeRot1Extd:Start");
+                this.ResetInPos();
+                this.RotationExtdW(30000, nPos);//1 nPos = 1 drgree 
+                this.WaitInPos(30000);
+                this.GposRW(3000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeRot1Step(int nPos)
+        {
+            try
+            {
+                WriteLog("ExeRot1Step:Start");
+                this.ResetInPos();
+                this.RotStepW(30000, nPos);
+                this.WaitInPos(30000);
+
+                this.GposRW(3000);
+                OnRot1StepComplete?.Invoke(this, true);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+                OnRot1StepComplete?.Invoke(this, false);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+                OnRot1StepComplete?.Invoke(this, false);
+            }
+        }
+        void ExeRsta(int nMode)
+        {
+            try
+            {
+                WriteLog("ExeRsta:Start");
+                this.ResetInPos();
+                this.ResetW(3000, nMode);
+                this.WaitInPos(30000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeInit()
+        {
+            try
+            {
+                WriteLog("ExeInit:Start");
+                this.InitW(3000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        void ExeStop()
+        {
+            try
+            {
+                WriteLog("ExeStop:Start");
+                this.StopW(3000);
+            }
+            catch (SException ex)
+            {
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        //void ExePause()
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExePause:Start");
+        //        this.PausW(3000);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        //void ExeMode(int nMode)
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeMode:Start");
+        //        this.ModeW(3000, nMode);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        //void ExeWtdt()
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeWtdt:Start");
+        //        this.WtdtW(15000);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        //void ExeSspd(int nMode)
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeSspd:Start");
+        //        this.SspdW(3000, nMode);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        //void ExeGver()
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeGver:Start");
+        //        this.GverW(3000);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        //void ExeSsiz(int nMode)
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeSsiz:Start");
+        //        this.SsizW(3000, nMode);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> ExeSsiz:" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> ExeSsiz:" + ex);
+        //    }
+        //}
+        //void ExeGsiz()
+        //{
+        //    try
+        //    {
+        //        WriteLog("ExeGsiz:Start");
+        //        this.GsizW(3000);
+        //    }
+        //    catch (SException ex)
+        //    {
+        //        WriteLog("<<SException>> :" + ex);
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        WriteLog("<<Exception>> :" + ex);
+        //    }
+        //}
+        #endregion
+
+        #region =========================== ORGN ===============================================
+
+        public void OrgnW(int nTimeout, int nOrgn = 0)
+        {
+            m_SignalSubSequence.Reset();
+            int PanelStatus = 0;//0:empty 1:panel exist 2:Vac error
+            if (!m_bSimulate)
+            {
+                switch (nOrgn)
+                { 
+                    case 2:
+                        {
+                            //檢查真空和是否有產品，如果有產品，就吸住產品回原點，沒產品的話關閉真空回原點
+                            m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                            PanelStatus = CheckWaferExisClampVacuum(true);
+                            if (PanelStatus == 1)
+                                ClampProduct();
+                            else if (PanelStatus == 0)
+                                UnclampProduct();
+                            else
+                            {
+                                SendAlmMsg(enumAlignerError.TurnOnVacuumFailure);
+                                throw new SException((int)enumAlignerError.TurnOnVacuumFailure, string.Format("TurnOnVacuumFailure. [{0}]", "ORGN"));
+                            }
+                            WriteLog("m_Motion.ORGN");
+                            m_Motion.ResetInPos();
+                            m_Motion.ORGN(0, (int)enumAGD301Axis.ALL);
+                            m_Motion.WaitInPos(60000);
+                            break;
+                        }
+                    case 1:
+                        {
+                            //檢查真空和是否有產品，如果有產品，報發錯誤，沒有產品才執行原點程序
+                            m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                            PanelStatus = CheckWaferExisClampVacuum(true);
+                            if (PanelStatus == 1)
+                            {
+                                SendAlmMsg(enumAlignerError.OriginPosReturnFailure);
+                                throw new SException((int)enumAlignerError.OriginPosReturnFailure, string.Format("ModeError(PanelExist). [{0}]", "ORGN"));
+                            }
+                            else if (PanelStatus == 0)
+                                UnclampProduct();
+                            else
+                            {
+                                SendAlmMsg(enumAlignerError.TurnOnVacuumFailure);
+                                throw new SException((int)enumAlignerError.TurnOnVacuumFailure, string.Format("TurnOnVacuumFailure. [{0}]", "ORGN"));
+                            }
+                            m_Motion.ResetInPos();
+                            m_Motion.ORGN(0, (int)enumAGD301Axis.ALL);
+                            m_Motion.WaitInPos(60000);
+                            break;
+                        }
+                    case 3:
+                        {
+                            m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                            PanelStatus = CheckWaferExisClampVacuum(true);
+                            if (PanelStatus == 1)
+                                ClampProduct();
+                            else if (PanelStatus == 0)
+                            {
+                                SendAlmMsg(enumAlignerError.OriginPosReturnFailure);
+                                throw new SException((int)enumAlignerError.OriginPosReturnFailure, string.Format("ModeError(PanelNotExist). [{0}]", "ORGN"));
+                            }
+                            else
+                            {
+                                SendAlmMsg(enumAlignerError.TurnOnVacuumFailure);
+                                throw new SException((int)enumAlignerError.TurnOnVacuumFailure, string.Format("TurnOnVacuumFailure. [{0}]", "ORGN"));
+                            }
+                            m_Motion.ResetInPos();
+                            m_Motion.ORGN(0, (int)enumAGD301Axis.ALL);
+                            m_Motion.WaitInPos(60000);
+                            break;
+                        }
+                    default:
+                        {
+                            //不檢查是否有產品，關閉真空，執行原點程序
+                            m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                            UnclampProduct();
+                            m_Motion.ResetInPos();
+                            m_Motion.ORGN(0, (int)enumAGD301Axis.ALL);
+                            m_Motion.WaitInPos(60000);
+                            break;
+                        }
+                }
+            }
+            else
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                m_bStatOrgnComplete = true;
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== HOME ===============================================
+
+        public void HomeW(int nTimeout, int nP1, int nP2)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                
+                /*_signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                Home(nP1, nP2);
+                if (!_signalAck[enumAlignerCommand.Home].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send HOME command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Home]));
+                }
+                if (_signalAck[enumAlignerCommand.Home].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send HOME command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Home]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== CLMP ===============================================
+
+        //protected abstract void ClmpAfterLiftPinDown(bool bCheckVac);
+        public virtual void ClmpW(int nTimeout, bool bCheckVac = true)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                ClampProduct();
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Set();
+                
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 500);
+            }
+            m_SignalSubSequence.Set();
+        }
+
+        private bool ClampProduct()
+        {
+            m_Motion.SetOutput(1, false);
+            m_Motion.SetOutput(2, true);
+            CheckWaferExisClampVacuum(false);
+            if (m_Motion.IsError)
+                return false;
+            return true;
+        }
+        private bool UnclampProduct()
+        {
+            m_Motion.SetOutput(1, true);
+            SpinWait.SpinUntil(() => false, 20);
+            m_Motion.SetOutput(2, false);
+            SpinWait.SpinUntil(() => false, 20);
+            if (m_Motion.IsError)
+                return false;
+            return true;
+        }
+        private int CheckWaferExisClampVacuum(bool isControlOutput)
+        {
+            int ret = 0;
+            bool In1 = false;
+            bool In2 = false;
+            if (isControlOutput)
+            {
+                UnclampProduct();
+                SpinWait.SpinUntil(() => false, 200);
+                ClampProduct();
+                SpinWait.SpinUntil(() => false, 600);
+            }
+            In1 = m_Motion.GetInput(1);
+            In2 = m_Motion.GetInput(2);
+            if (In1 == true && In2 == true)
+            {
+                m_bPanelExistUseVac = true;
+                ret = 1;//有物體Input:1&2 ON 
+            }
+            else if (In1 == false && In2 == true)
+            {
+                m_bPanelExistUseVac = false;
+                ret = 0; //沒物體，有開真空 Input 1: OFF Input 2: ON
+            }
+            else
+            {
+                m_bPanelExistUseVac = true;
+                ret = 2;//真空失效
+            }
+            if (isControlOutput)
+                UnclampProduct();
+            return ret;
+        }
+
+        #endregion 
+
+        #region =========================== UCLM ===============================================
+
+        //protected abstract void UclmAfterLiftPinUp();
+        //protected abstract void UclmAfterLiftPinDown();
+        public virtual void UclmW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                UnclampProduct();
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Set();
+            }
+            else
+            {
+                //SpinWait.SpinUntil(() => false, 1000);//看LOG需一秒
+                SpinWait.SpinUntil(() => false, 500);
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== ALGN ===============================================
+
+
+        public void AlgnW(int nTimeout, int nMode = 0, int nPos = -1)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                ResetInPos();
+                //GetCameraOffset
+                m_Motion.ResetInPos();
+                m_Motion.Mrel(30000, TestPos_R, TestPos_Y, TestPos_X);
+                m_Motion.WaitInPos(30000);
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 1000);
+            }
+            m_SignalSubSequence.Set();
+        }
+        int TestPos_X = 0;
+        int TestPos_Y = 0;
+        int TestPos_R = 0;
+        public void SetTestMRELLocation(int R,int X, int Y)
+        {
+            TestPos_X = X;
+            TestPos_Y = Y;
+            TestPos_R = R;
+        }
+
+        public void Algn1W(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Algn1();
+
+                if (!_signalAck[enumAlignerCommand.Alignment].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send ALGN command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Alignment]));
+                }
+                if (_signalAck[enumAlignerCommand.Alignment].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send ALGN command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Alignment]));
+                }*/
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 500);
+                Raxispos = 0;
+            }
+            m_SignalSubSequence.Set();
+        }
+
+
+        public void AlgnDW(int nTimeout, string strPos)//0~360
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*AlgnD(strPos);
+                if (!_signalAck[enumAlignerCommand.Alignment].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send ALGN command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Alignment]));
+                }
+                if (_signalAck[enumAlignerCommand.Alignment].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send ALGN command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Alignment]));
+                }*/
+            }
+            else
+            {
+                //SpinWait.SpinUntil(() => false, 6000);//看LOG需六秒
+                SpinWait.SpinUntil(() => false, 1000);
+
+
+                double value = Convert.ToDouble(strPos);
+                Raxispos = (int)(value * 1000);
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== CALN ===============================================
+
+        //public void CalnW(int nTimeout)
+        //{
+        //    m_SignalSubSequence.Reset();
+        //    if (!m_bSimulate)
+        //    {
+        //        /*Caln();
+        //        if (!_signalAck[enumAlignerCommand.CameraAlignment].WaitOne(nTimeout))
+        //        {
+        //            SendAlmMsg(enumAlignerError.AckTimeout);
+        //            throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send CALN command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.CameraAlignment]));
+        //        }
+        //        if (_signalAck[enumAlignerCommand.CameraAlignment].bAbnormalTerminal)
+        //        {
+        //            SendAlmMsg(enumAlignerError.SendCommandFailure);
+        //            throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send CALN command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.CameraAlignment]));
+        //        }*/
+        //    }
+        //    else
+        //    {
+
+        //    }
+        //    m_SignalSubSequence.Set();
+        //}
+        #endregion
+
+        #region =========================== Rot1EXTD ===========================================
+
+        protected virtual void RotationExtdW(int nTimeout, int nPos)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                int n = nPos;
+                //0~360
+                while (n > 360) { n -= 360; }
+                try
+                {
+                    m_Motion.ResetInPos();
+                    m_Motion.AxisMabs(nTimeout, enumAGD301Axis.AXS1, n * 1000);//1度 = 1000
+                    m_Motion.WaitInPos(nTimeout);
+                }
+                catch (SException ex)
+                {
+                    m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    SendAlmMsg(enumAlignerError.MotionAbnormal);
+                    WriteLog("<<SException>> :" + ex);
+                }
+                catch (Exception ex)
+                {
+                    m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    SendAlmMsg(enumAlignerError.MotionAbnormal);
+                    WriteLog("<<Exception>> :" + ex);
+                }
+            }
+            else
+            {
+                while (nPos >= 360000)
+                    nPos -= 360000;
+                Raxispos += nPos;
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== Rot1Step ===========================================
+
+        protected virtual void RotStepW(int nTimeout, int nPos)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+                
+                try
+                {
+                    m_Motion.ResetInPos();
+                    m_Motion.AxisMrel(nTimeout, enumAGD301Axis.AXS1, nPos);//1度 = 1000 nPos
+                    m_Motion.WaitInPos(nTimeout);
+                }
+                catch (SException ex)
+                {
+                    m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    SendAlmMsg(enumAlignerError.MotionAbnormal);
+                    WriteLog("<<SException>> :" + ex);
+                }
+                catch (Exception ex)
+                {
+                    m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                    SendAlmMsg(enumAlignerError.MotionAbnormal);
+                    WriteLog("<<Exception>> :" + ex);
+                }
+            }
+            else
+            {
+                while (nPos >= 360000)
+                    nPos -= 360000;
+                Raxispos += nPos;
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== READ ===============================================
+
+        public void ReadW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Read();
+                if (!_signalAck[enumAlignerCommand.ReadID].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send READ command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.ReadID]));
+                }
+                if (_signalAck[enumAlignerCommand.ReadID].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send READ command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.ReadID]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== EVNT ===============================================
+
+        public void EventW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Event();
+                if (!_signalAck[enumAlignerCommand.Event].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send Event command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Event]));
+                }
+                if (_signalAck[enumAlignerCommand.Event].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send Event command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Event]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== RSTA ===============================================
+
+        public void ResetW(int nTimeout, int nReset = 0)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Motion.Reset(3000);
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Set();
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== INIT ===============================================
+
+        public void InitW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_bIsError = false;
+                m_Motion.ResetInPos();
+                m_Motion.INIT();
+                m_Motion.ResetInPos();
+                //m_Camera.INIT();
+                m_bIsError = IsError;
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Set();
+                m_Signals[enumAlignerSignalTable.Remote].Set();
+                if(m_bIsError)
+                    throw new SException((int)enumAlignerError.InitialFailure, string.Format("Controller or camera has error.[{0}]", "INIT"));
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== STOP ===============================================
+
+        public void StopW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                m_Motion.STOP();
+                m_Signals[enumAlignerSignalTable.MotionCompleted].Set();
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 1000);
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion \
+
+        #region =========================== PAUS ===============================================
+
+        public void PausW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Paus();
+                if (!_signalAck[enumAlignerCommand.Pause].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send Pause command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Pause]));
+                }
+                if (_signalAck[enumAlignerCommand.Pause].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send Pause command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Pause]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== MODE ===============================================
+
+        public void ModeW(int nTimeout, int nMode)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Mode(nMode);
+                if (!_signalAck[enumAlignerCommand.Mode].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send Mode command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Mode]));
+                }
+                if (_signalAck[enumAlignerCommand.Mode].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send Mode command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Mode]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== WTDT ===============================================
+
+        public void WtdtW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Wtdt();
+                if (!_signalAck[enumAlignerCommand.Wtdt].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send WTDT command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Wtdt]));
+                }
+                if (_signalAck[enumAlignerCommand.Wtdt].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send WTDT command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Wtdt]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== RTDT ===============================================
+
+        public void RtdtW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Rtdt();
+                if (!_signalAck[enumAlignerCommand.GetData].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send RTDT command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetData]));
+                }
+                if (_signalAck[enumAlignerCommand.GetData].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send RTDT command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetData]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== SSPD ===============================================
+
+        public void SspdW(int nTimeout, int nVariable)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*_signals[enumAlignerSignalTable.ProcessCompleted].Reset();
+                Sspd(nVariable);
+                if (!_signalAck[enumAlignerCommand.Speed].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send SSPD command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Speed]));
+                }
+                if (_signalAck[enumAlignerCommand.Speed].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send SSPD command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Speed]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== STAT ===============================================
+
+        public void StatW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Stat();
+                if (!_signalAck[enumAlignerCommand.Status].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send Status command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.Status]));
+                }
+                if (_signalAck[enumAlignerCommand.Status].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send Status command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.Status]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GPIO ===============================================
+
+        public void GpioW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gpio();
+                if (!_signalAck[enumAlignerCommand.GetIO].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GPIO command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetIO]));
+                }
+                if (_signalAck[enumAlignerCommand.GetIO].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GPIO command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetIO]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GVER ===============================================
+
+        public void GverW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gver();
+                if (!_signalAck[enumAlignerCommand.GetVersion].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GVER command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetVersion]));
+                }
+                if (_signalAck[enumAlignerCommand.GetVersion].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GVER command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetVersion]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GLOG ===============================================
+
+        public void GlogW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Glog();
+                if (!_signalAck[enumAlignerCommand.GetLog].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GLOG command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetLog]));
+                }
+                if (_signalAck[enumAlignerCommand.GetLog].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GLOG command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetLog]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== STIM ===============================================
+
+        public void StimW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Stim();
+                if (!_signalAck[enumAlignerCommand.SetDateTime].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send STIM command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.SetDateTime]));
+                }
+                if (_signalAck[enumAlignerCommand.SetDateTime].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send STIM command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.SetDateTime]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GTIM ===============================================
+
+        public void GtimW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gtim();
+                if (!_signalAck[enumAlignerCommand.GetDateTime].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GTIM command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetDateTime]));
+                }
+                if (_signalAck[enumAlignerCommand.GetDateTime].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GTIM command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetDateTime]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GPOS ===============================================
+
+        public void GposW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            /*Gpos();
+             if (!_signalAck[enumAlignerCommand.GetPos].WaitOne(nTimeout))
+             {
+                 SendAlmMsg(enumAlignerError.AckTimeout);
+                 throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GPOS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetPos]));
+             }
+             if (_signalAck[enumAlignerCommand.GetPos].bAbnormalTerminal)
+             {
+                 SendAlmMsg(enumAlignerError.SendCommandFailure);
+                 throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GPOS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetPos]));
+             }*/
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== XAX1.GPOS ==========================================
+
+        public void GposXW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            /*GposX();
+            if (!_signalAck[enumAlignerCommand.GetXAxisPos].WaitOne(nTimeout))
+            {
+                SendAlmMsg(enumAlignerError.AckTimeout);
+                throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send XAxis GPOS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetXAxisPos]));
+            }
+            if (_signalAck[enumAlignerCommand.GetXAxisPos].bAbnormalTerminal)
+            {
+                SendAlmMsg(enumAlignerError.SendCommandFailure);
+                throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send XAxis GPOS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetXAxisPos]));
+            }*/
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== YAX1.GPOS ==========================================
+
+
+        public void GposYW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            /*GposY();
+            if (!_signalAck[enumAlignerCommand.GetYAxisPos].WaitOne(nTimeout))
+            {
+                SendAlmMsg(enumAlignerError.AckTimeout);
+                throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send YAxis GPOS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetYAxisPos]));
+            }
+            if (_signalAck[enumAlignerCommand.GetYAxisPos].bAbnormalTerminal)
+            {
+                SendAlmMsg(enumAlignerError.SendCommandFailure);
+                throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send YAxis GPOS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetYAxisPos]));
+            }*/
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== ZAX1.GPOS ==========================================
+
+        public void GposZW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            /*GposZ();
+            if (!_signalAck[enumAlignerCommand.GetZAxisPos].WaitOne(nTimeout))
+            {
+                SendAlmMsg(enumAlignerError.AckTimeout);
+                throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send ZAxis GPOS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetZAxisPos]));
+            }
+            if (_signalAck[enumAlignerCommand.GetZAxisPos].bAbnormalTerminal)
+            {
+                SendAlmMsg(enumAlignerError.SendCommandFailure);
+                throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send ZAxis GPOS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetZAxisPos]));
+            }*/
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== ROT1.GPOS ==========================================
+
+        public void GposRW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*GposR();
+                if (!_signalAck[enumAlignerCommand.GetRAxisPos].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send Rot1 GPOS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetRAxisPos]));
+                }
+                if (_signalAck[enumAlignerCommand.GetRAxisPos].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send Rot1 GPOS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetRAxisPos]));
+                }*/
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GWID ===============================================
+
+        public void GwidW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gwid();
+                if (!_signalAck[enumAlignerCommand.GetType].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GWID command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetType]));
+                }
+                if (_signalAck[enumAlignerCommand.GetType].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GWID command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetType]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== TDST ===============================================
+
+        public void TdstW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Tdst();
+                if (!_signalAck[enumAlignerCommand.NotchStopPos].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send TDST command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.NotchStopPos]));
+                }
+                if (_signalAck[enumAlignerCommand.NotchStopPos].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send TDST command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.NotchStopPos]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GTAD ===============================================
+
+        public void GtadW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gtad();
+                if (!_signalAck[enumAlignerCommand.GetSensorValue].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GTAD command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetSensorValue]));
+                }
+                if (_signalAck[enumAlignerCommand.GetSensorValue].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GTAD command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetSensorValue]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GPRS ===============================================
+
+        public void GprsW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gprs();
+                if (!_signalAck[enumAlignerCommand.GetVacuumValue].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GPRS command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetVacuumValue]));
+                }
+                if (_signalAck[enumAlignerCommand.GetVacuumValue].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GPRS command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetVacuumValue]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion 
+
+        #region =========================== GSIZ ===============================================
+
+        public void GsizW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gsiz();
+                if (!_signalAck[enumAlignerCommand.GetSize].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GSIZ command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetSize]));
+                }
+                if (_signalAck[enumAlignerCommand.GetSize].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GSIZ command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetSize]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== SSIZ ===============================================
+
+        public void SsizW(int nTimeout, int nSsiz = 0)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Ssiz(nSsiz);
+                if (!_signalAck[enumAlignerCommand.SetSize].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send SSIZ command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.SetSize]));
+                }
+                if (_signalAck[enumAlignerCommand.SetSize].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send SSIZ command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.SetSize]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GTID ===============================================
+
+        public void GtidW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gtid();
+                if (!_signalAck[enumAlignerCommand.GetID].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GTID command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetID]));
+                }
+                if (_signalAck[enumAlignerCommand.GetID].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GTID command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetID]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        #region =========================== GTMP ===============================================
+
+
+        public void GtmpW(int nTimeout)
+        {
+            m_SignalSubSequence.Reset();
+            if (!m_bSimulate)
+            {
+                /*Gtmp();
+                if (!_signalAck[enumAlignerCommand.GetMP].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.AckTimeout);
+                    throw new SException((int)enumAlignerError.AckTimeout, string.Format("Send GTMP command and wait Ack was timeout. [{0}]", _dicCmdsTable[enumAlignerCommand.GetMP]));
+                }
+                if (_signalAck[enumAlignerCommand.GetMP].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.SendCommandFailure);
+                    throw new SException((int)enumAlignerError.SendCommandFailure, string.Format("Send GTMP command is Canecl. [{0}]", _dicCmdsTable[enumAlignerCommand.GetMP]));
+                }*/
+            }
+            else
+            {
+
+            }
+            m_SignalSubSequence.Set();
+        }
+        #endregion
+
+        public void ResetChangeModeCompleted()
+        {
+            m_Signals[enumAlignerSignalTable.Remote].Reset();
+        }
+        public void WaitChangeModeCompleted(int nTimeout)
+        {
+            if (!m_bSimulate)
+            {
+                if (!m_Signals[enumAlignerSignalTable.Remote].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.InitialFailure);
+                    throw new SException((int)enumAlignerError.InitialFailure, string.Format("Wait Mode was timeout. [Timeout = {0} ms]", nTimeout));
+                }
+                if (m_Signals[enumAlignerSignalTable.Remote].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.InitialFailure);
+                    throw new SException((int)enumAlignerError.InitialFailure, string.Format("Motion is Mode end."));
+                }
+            }
+        }
+
+        public void ResetOrgnSinal()
+        {
+            m_Signals[enumAlignerSignalTable.OPRCompleted].Reset();
+            m_bStatOrgnComplete = false;
+        }
+        public void WaitOrgnCompleted(int TimeOut)
+        {
+            if (!m_bSimulate)
+            {
+                if (!m_Signals[enumAlignerSignalTable.OPRCompleted].WaitOne(TimeOut))
+                {
+                    SendAlmMsg(enumAlignerError.OriginPosReturnTimeout);
+                    throw new SException((int)(enumAlignerError.OriginPosReturnTimeout), "Aligner Orgn Fail");
+                }
+                if (m_Signals[enumAlignerSignalTable.OPRCompleted].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.OriginPosReturnFailure);
+                    throw new SException((int)(enumAlignerError.OriginPosReturnFailure), "Aligner Orgn Fail");
+                }
+            }
+            else
+            {
+                m_bStatOrgnComplete = true;
+                SpinWait.SpinUntil(() => false, 100);
+            }
+        }
+
+        public void ResetInPos()
+        {
+            m_Signals[enumAlignerSignalTable.MotionCompleted].Reset();
+            m_eStatInPos = enumAlignerStatus.Moving;
+        }
+        public void WaitInPos(int nTimeout)
+        {
+            SpinWait.SpinUntil(() => false, 200);
+            if (!m_bSimulate)
+            {
+                if (!m_Signals[enumAlignerSignalTable.MotionCompleted].WaitOne(nTimeout))
+                {
+                    SendAlmMsg(enumAlignerError.MotionTimeout);
+                    throw new SException((int)enumAlignerError.MotionTimeout, string.Format("Wait motion complete was timeout. [Timeout = {0} ms]", nTimeout));
+                }
+                if (m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal)
+                {
+                    SendAlmMsg(enumAlignerError.MotionAbnormal);
+                    throw new SException((int)enumAlignerError.MotionAbnormal, string.Format("Motion is abnormal end."));
+                }
+            }
+            else
+            {
+                SpinWait.SpinUntil(() => false, 100);
+                m_eStatInPos = enumAlignerStatus.InPos;
+            }
+        }
+
+        #region =========================== OnOccurError =======================================
+        //  發生STAT異常
+        protected void SendAlmMsg(string strCode)
+        {
+            WriteLog(string.Format("Occur stat Error : {0}", strCode));
+            if (strCode.Length != 4) return;
+            //  ALN1 13 11 00000
+            //  ALN2 14 11 00000          
+            int nCode = Convert.ToInt32(strCode, 16) /*+ (13 + BodyNo - 1) * 10000000 + 11 * 100000*/;
+            OnOccurStatErr?.Invoke(this, new OccurErrorEventArgs(nCode));
+            SendAlmMsg(enumAlignerError.Status_Error);
+        }
+        //  解除STAT異常
+        protected void RestAlmMsg(string strCode)
+        {
+            WriteLog(string.Format("Rest stat Error : {0}", strCode));
+            if (strCode.Length != 4) return;
+            //  ALN1 15 11 00000
+            //  ALN2 16 11 00000          
+            int nCode = Convert.ToInt32(strCode, 16) /*+ (13 + BodyNo - 1) * 10000000 + 11 * 100000*/;
+            OnOccurErrorRest?.Invoke(this, new OccurErrorEventArgs(nCode));
+
+        }
+        //  Cancel Code
+        protected void SendCancelMsg(string strCode)
+        {
+            WriteLog(string.Format("Occur cancel Error : {0}", strCode));
+            if (strCode.Length != 4) return;
+            //  ALN1 15 11 00000
+            //  ALN2 16 11 00000          
+            int nCode = Convert.ToInt32(strCode, 16) /*+ (13 + BodyNo - 1) * 10000000 + 12 * 100000*/;
+            OnOccurCancel?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        protected void SendAlmMsg(enumAlignerError eAlarm)
+        {
+            WriteLog(string.Format("Occur eAlarm Error : {0}", eAlarm));
+            //  ALN1 15 10 00000
+            //  ALN2 16 10 00000          
+            int nCode = (int)eAlarm /*+ (13 + BodyNo - 1) * 10000000 + 10 * 100000*/;
+            OnOccurCustomErr?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+
+        //  發生警告
+        public void SendWarningMsg(enumAlignerWarning eWarning, [CallerMemberName] string meberName = null, [CallerLineNumber] int lineNumber = 0)
+        {
+            WriteLog(string.Format("Occur Warning  : {0}", eWarning), meberName, lineNumber);
+            int nCode = (int)eWarning;
+            OnOccurWarning?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        //  解除警告
+        public void RestWarningMsg(enumAlignerWarning eWarning, [CallerMemberName] string meberName = null, [CallerLineNumber] int lineNumber = 0)
+        {
+            WriteLog(string.Format("Reset Warning  : {0}", eWarning), meberName, lineNumber);
+            int nCode = (int)eWarning;
+            OnOccurWarningRest?.Invoke(this, new OccurErrorEventArgs(nCode));
+        }
+        #endregion
+
+        #region Run貨權
+        static private object _objHolding = new object(); //鎖臨界區間
+        static private bool _blnHold = false; //run貨權
+        private bool _bIsRunning = false;
+        public bool IsHoldPermission()//TRUE 表示是被其他HOLD
+        {
+            lock (_objHolding)
+            {
+                return _blnHold && _bIsRunning == false;
+            }
+        }
+        /// <summary>
+        /// 搶run貨權
+        /// </summary>
+        /// <returns></returns>
+        public bool GetRunningPermission()
+        {
+            lock (_objHolding)
+            {
+                if (_bIsRunning) return true; //已經搶到run貨權, 直接return true.
+                if (_blnHold) return false; //run貨權已經被搶走
+
+                _bIsRunning = true; //搶到了!
+                _blnHold = true;
+                return _blnHold;
+            }
+        }
+        /// <summary>
+        /// 釋放run貨權
+        /// </summary>
+        public void ReleaseRunningPermission()
+        {
+            lock (_objHolding)
+            {
+                if (!_bIsRunning) return; //沒搶到run貨權就不能釋放                 
+                _bIsRunning = false;
+                _blnHold = false;
+            }
+        }
+        #endregion
+
+        //==============================================================================     
+        
+        //==============================================================================     
+        public bool IsZaxsInBottom() { return true; }
+
+        public virtual bool WaferExists()
+        {
+            //需要處理
+            CheckWaferExisClampVacuum(true);
+            return m_bPanelExistUseVac;
+        }
+        public bool IsClamp()
+        {
+            //需要處理
+            if (m_Motion.GetInput(1) == true || m_Motion.GetInput(2) == true)
+            {
+                m_bPanelExistUseVac = true;
+                return true; //有物體Input:1&2 ON 
+            }
+            else
+            {
+                return false; //沒物體，有開真空 Input 1: OFF Input 2: ON
+            }
+        }
+        public bool IsUnClamp()
+        {
+            //需要處理
+            if (m_Motion.GetInput(1) == true || m_Motion.GetInput(2) == true)
+            {
+                m_bPanelExistUseVac = true;
+                return false; //有物體Input:1&2 ON 
+            }
+            else
+            {
+                return true; //沒物體，有開真空 Input 1: OFF Input 2: ON
+            }
+        }
+        public bool IsAirOK() { throw new NotImplementedException(); }
+        public bool IsFanOK() { throw new NotImplementedException(); }
+
+   
+        public void AlignerMoveTest_MABS(int R, int X, int Y)
+        {
+            
+            try
+            {
+                m_Motion.ResetInPos();
+                m_Motion.Mabs(30000, R, Y, X);
+                m_Motion.WaitInPos(60000);
+            }
+            catch (SException ex)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                SendAlmMsg(enumAlignerError.MotionAbnormal);
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                SendAlmMsg(enumAlignerError.MotionAbnormal);
+                WriteLog("<<Exception>> :" + ex);
+            }
+        }
+        public void AlignerMoveTest_MREL(int R, int X, int Y)
+        {
+            try
+            {
+                m_Motion.ResetInPos();
+                m_Motion.Mrel(60000, R, Y, X);
+                m_Motion.WaitInPos(60000);
+            }
+            catch (SException ex)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                SendAlmMsg(enumAlignerError.MotionAbnormal);
+                WriteLog("<<SException>> :" + ex);
+            }
+            catch (Exception ex)
+            {
+                m_Signals[enumAlignerSignalTable.MotionCompleted].bAbnormalTerminal = true;
+                SendAlmMsg(enumAlignerError.MotionAbnormal);
+                WriteLog("<<Exception>> :" + ex);
+            }
+            
+        }
+    }
+}

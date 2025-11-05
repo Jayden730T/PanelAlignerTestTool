@@ -1,0 +1,42 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <MSBuildAllProjects>$(MSBuildAllProjects);$(MSBuildThisFileFullPath)</MSBuildAllProjects>
+    <HasSharedItems>true</HasSharedItems>
+    <SharedGUID>a1f3e5da-c2e1-485c-b572-4d636b8642eb</SharedGUID>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration">
+    <Import_RootNamespace>RorzeUnit</Import_RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Agito\EnumAgito.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Agito\IniFile.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Agito\SSAGD301_Motion.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Agito\SSAgitoParm.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Aligner\Enum\EnumAligner.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Aligner\Enum\EnumAlignerError.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Aligner\Evnt\AlignerEventArgs.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Aligner\SSAlignerPanelXYR.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Camera\Enum\EnumCamera.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Camera\Evnt\CameraEventArgs.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\Camera\SSCamera.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\Enum\EnumRC500.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\Enum\EnumRC500Error.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\Evnt\RC500EventArgs.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC530_IO.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC550_IO.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC550_Motion.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC560_Motion.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC5X0Parents_IO.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\RC500\SSRC5X0Parents_Motion.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\SException.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Class\SWafer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Evnt\WaferDataEventArgs.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Net\Sockets\sClient.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Net\Sockets\sRorzeSocket.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Net\Sockets\sServer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Interface\I_Aligner.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Interface\I_RC5X0_IO.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Interface\I_RC5X0_Motion.cs" />
+  </ItemGroup>
+</Project>
