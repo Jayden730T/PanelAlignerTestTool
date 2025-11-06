@@ -708,7 +708,7 @@ namespace PanelAlignerTest4
                         }
                         else if(axis == "XAX1" || axis == "YAX1")
                         {
-                            stepAckReply = "aALN1.STAT:11000/0000:";
+                            stepAckReply = $"a{alignerName}.ROT.STEP:";
                             stepAxisForReply = "";
                             WriteLog($"Executing X,Y simulator");
                             return new List<string> { stepAckReply };
